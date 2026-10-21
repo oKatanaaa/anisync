@@ -110,6 +110,51 @@ test('cache garbage from a crash is swept on the next scan', async () => {
   assert.ok(fss.existsSync(path.join(cacheDir, item.id, 'video.mp4')), 'the real rendition survives');
 });
 
+test('sidecar subtitle and audio files become switchable tracks', async () => {
+  const name = 'Sidecar Episode - 01.mkv';
+  const video = path.join(mediaDir, name);
+  execSync(
+    `ffmpeg -y -v error -f lavfi -i testsrc2=size=320x240:rate=10 -f lavfi -i sine=frequency=440 -t 2 ` +
+      `-c:v libx264 -pix_fmt yuv420p -c:a aac -metadata:s:a:0 language=jpn "${video}"`,
+    { stdio: 'ignore' },
+  );
+  await fs.writeFile(
+    path.join(mediaDir, 'Sidecar Episode - 01.en.srt'),
+    '1\n00:00:00,200 --> 00:00:01,500\nExternal subtitle line.\n',
+  );
+  execSync(
+    `ffmpeg -y -v error -f lavfi -i sine=frequency=880:duration=2 -c:a aac "${path.join(mediaDir, 'Sidecar Episode - 01.eng.m4a')}"`,
+    { stdio: 'ignore' },
+  );
+
+  const library = new Library({});
+  await library.scan();
+  const item = [...library.items.values()].find((i) => i.title.startsWith('Sidecar Episode'));
+  assert.ok(item, 'episode scanned');
+  assert.equal(item.audios.length, 2, 'muxed audio plus the external dub');
+  assert.equal(item.audios[1].origin, 'sidecar');
+  assert.equal(item.audios[1].lang, 'eng');
+  const sidecarSub = item.subs.find((s) => s.origin === 'sidecar');
+  assert.ok(sidecarSub, 'external subtitle track found');
+  assert.equal(sidecarSub.lang, 'en');
+  assert.equal(sidecarSub.label, 'English');
+
+  await library.prepare(item.id);
+
+  const cache = path.join(cacheDir, item.id);
+  assert.ok(fss.existsSync(path.join(cache, 'audio', '1.m4a')), 'external dub was converted');
+  const vtt = await fs.readFile(path.join(cache, 'subs', sidecarSub.vtt), 'utf8');
+  assert.ok(vtt.startsWith('WEBVTT'), 'external subtitle became WebVTT');
+  assert.match(vtt, /External subtitle line\./);
+  assert.ok(fss.existsSync(path.join(cache, 'subs', sidecarSub.file)), 'and an ASS copy for burn-in');
+
+  // The library payload offers it without leaking server paths.
+  const listed = library.list().find((m) => m.id === item.id);
+  const audioPayload = listed.audioTracks.find((a) => a.index === 1);
+  assert.ok(audioPayload.url.includes('/audio/1.m4a'));
+  assert.equal(JSON.stringify(listed).includes(mediaDir), false, 'no absolute paths in the payload');
+});
+
 test('a probe cache makes the second scan cheap and still correct', async () => {
   makeEpisode('Episode 02.mkv');
   const first = new Library({});

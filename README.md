@@ -87,8 +87,8 @@ All optional, via environment variables:
 ## Testing
 
 ```bash
-npm test          # 48 unit tests: sync math, room state machine, hardening
-npm run test:ui   # 106 checks driving the real UI in real Chrome
+npm test          # 72 unit tests: sync math, rooms, hardening, subtitles, sidecars
+npm run test:ui   # 131 checks driving the real UI in real Chrome
 ```
 
 `npm run test:ui` needs the server running. Scenarios whose name matches an
@@ -135,9 +135,56 @@ test/
   sync.test.js      sync math: clock offset, drift decisions, 60 s simulation
   rooms.test.js     room state machine: host, lock, capacity, end of episode, idle reset
   hardening.test.js stall watchdog, child cleanup, cache GC, cache validation
+  subtitles.test.js ASS → WebVTT conversion: alignment, position, styling, escaping
+  sidecars.test.js  which external files attach to which episode, and their labels
   ui.mjs            user-facing suite (real Chrome, real clicks, screenshots on failure)
+  make-tracks-fixture.sh  builds an episode with an embedded track and sidecars
   make-fixture.sh  builds a nasty test file (10-bit HEVC + ASS + font attachment)
 ```
+
+## Audio and subtitle tracks
+
+The player has one small control for both (the **CC** button, or `c`). It only
+appears when there is something to switch, so a plain single-audio episode has no
+extra buttons.
+
+Choices are **per viewer**, never room-wide: one person can watch the dub with
+Spanish subtitles while everyone else keeps the original audio. The choice is
+remembered per episode (and reused for the next one).
+
+**Subtitles.** Burned-in subtitles are the default because they keep ASS
+typesetting, signs and karaoke exactly as the release intends. Burned text cannot
+be switched off, so picking "Off" or another track switches the player to a
+*subtitle-free* rendition of the same episode, which the server encodes once, on
+demand (progress shows in the menu) and keeps. Switching between soft tracks and
+off is then instant. Soft tracks are WebVTT generated from the ASS script with
+alignment, position, italics and bold preserved — ffmpeg's own WebVTT muxer drops
+all of that, which would put a top-of-screen sign at the bottom of the frame.
+
+**Audio.** Chrome has no API for choosing an audio track inside a `<video>`, so
+track 0 stays muxed in the video (sample-accurate) and every other track is
+extracted to its own AAC file. Selecting one mutes the video element and plays the
+second element, kept in step by the same drift controller that syncs the room.
+
+**External tracks.** Releases often ship the dub or subtitles as separate files.
+A file attaches to an episode when it shares the episode's full stem and has a
+usable extension:
+
+```
+Episode 01.mkv
+Episode 01.en.ass          -> subtitles: English
+Episode 01.en.forced.ass   -> subtitles: English · Forced
+Episode 01.es.srt          -> subtitles: Spanish
+Episode 01.eng.m4a         -> audio: English
+```
+
+Subtitles: `.ass .ssa .srt .vtt`. Audio: `.m4a .aac .opus .flac .mp3 .ogg .wav
+.mka .ac3 .eac3 .dts`. The leftovers after the episode name are read for a
+language tag (`en`, `eng`, `English`) and known flags (`forced`, `sdh`, `signs`,
+`cc`); anything else becomes part of the label. `Episode 011.en.ass` never
+attaches to `Episode 01`. A video with no audio inside it but a dub beside it gets
+that dub muxed in automatically. Subtitle and audio sidecars can also be uploaded
+from the library panel — they attach to whatever they are named after.
 
 ## Performance
 
@@ -216,6 +263,8 @@ failure modes above are covered without it.
 ## Deliberate limits
 
 - **Three seats.** It is a room for friends, not a platform; capacity is enforced on the server.
+- **Image-based subtitles (PGS/VOBSUB) cannot be switched.** They are pictures, not text, so there is nothing to render soft or to convert; the baked-in default is all a browser can show.
+- **A subtitle-free rendition costs one extra encode.** It is built the first time anyone asks for "off" or a soft track, then cached; until it is ready the burned-in picture keeps playing.
 - **One room.** No accounts, no rooms list. The network (Tailscale) is the auth boundary.
 - **Subtitles are baked in by default.** Toggle-free, but nothing to switch off. Set `SUBTITLES=track` to serve soft WebVTT (toggleable, styling lost). Bitmap subtitles (PGS/DVD) are skipped in track mode and are not burned.
 - **No voice chat.** Use Discord; it is better at that than this will ever be.

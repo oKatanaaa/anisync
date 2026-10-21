@@ -35,6 +35,19 @@
   <section class="stage-wrap">
     <div class="stage empty" id="stage">
       <video id="video" playsinline preload="auto"></video>
+      <!-- Alternate audio tracks play here while the video element is muted. -->
+      <audio id="altAudio" preload="auto"></audio>
+
+      <div class="track-menu hidden" id="trackMenu" role="dialog" aria-label="Audio and subtitles">
+        <div class="track-group" id="subGroup">
+          <p class="track-title">Subtitles</p>
+          <div class="track-list" id="subList"></div>
+        </div>
+        <div class="track-group" id="audioGroup">
+          <p class="track-title">Audio</p>
+          <div class="track-list" id="audioList"></div>
+        </div>
+      </div>
 
       <div id="placeholder" class="placeholder">
         <div class="placeholder-inner">
@@ -66,7 +79,9 @@
           </button>
           <span id="time" class="time">0:00 / 0:00</span>
           <div class="spacer"></div>
-          <button id="subsBtn" class="icon-btn text-btn" type="button" title="Subtitles">CC</button>
+          <button id="subsBtn" class="icon-btn text-btn hidden" type="button" title="Audio and subtitles (c)" aria-haspopup="true" aria-expanded="false">
+            CC<span class="caret" aria-hidden="true">▾</span>
+          </button>
           <button id="muteBtn" class="icon-btn" type="button" title="Mute (m)">
             <svg viewBox="0 0 24 24" width="18" height="18"><path d="M4 9v6h4l5 4V5L8 9H4z" fill="currentColor"/><path class="wave" d="M16 8.5a4.5 4.5 0 010 7" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round"/></svg>
           </button>
@@ -113,7 +128,7 @@
         <button id="rescanBtn" class="btn ghost compact" type="button">Rescan folder</button>
         <label class="btn ghost compact upload-label">
           Upload
-          <input id="uploadInput" type="file" accept="video/*,.mkv,.ts" hidden />
+          <input id="uploadInput" type="file" accept="video/*,.mkv,.ts,.m4a,.aac,.opus,.flac,.mp3,.ass,.ssa,.srt,.vtt" hidden />
         </label>
       </div>
       <div id="uploadBar" class="upload-bar hidden"><div id="uploadFill"></div><span id="uploadLabel">uploading…</span></div>

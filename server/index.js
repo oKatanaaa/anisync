@@ -56,6 +56,7 @@ const library = new Library({
   onEvent: (evt) => {
     if (evt.type === 'progress') broadcast({ t: 'progress', id: evt.id, progress: evt.progress, stage: evt.stage });
     if (evt.type === 'prepared') broadcast({ t: 'library' });
+    if (evt.type === 'variant') broadcast({ t: 'library' });
     if (evt.type === 'failed') broadcast({ t: 'notice', level: 'error', text: `Prepare failed: ${evt.message}` });
   },
 });
@@ -154,7 +155,9 @@ app.post('/api/upload', (req, res) => {
 
   bus.on('file', (_field, file, info) => {
     const safe = path.basename(info.filename).replace(/[^\w.\- ()[\]]+/g, '_').slice(0, 180);
-    if (!/\.(mkv|mp4|webm|avi|mov|m4v|ts)$/i.test(safe)) {
+    // Videos become library items; subtitle and audio sidecars are accepted so
+    // an episode's tracks can be uploaded next to it and picked up by the scan.
+    if (!/\.(mkv|mp4|webm|avi|mov|m4v|ts|m2ts|m4a|aac|opus|flac|mp3|ogg|wav|ass|ssa|srt|vtt)$/i.test(safe)) {
       failure = 'unsupported file type';
       file.resume();
       return;
@@ -247,6 +250,9 @@ app.get('/media/:id/video.mp4', (req, res) => {
     const item = library.get(id);
     if (item) {
       item.prepared = false;
+      // Let the clients know, so they wait for the rebuild instead of burning
+      // their retry budget on a file that is still being encoded.
+      broadcast({ t: 'library' });
       library.prepare(id).catch(() => {});
     }
     return res.status(409).json({ error: 'not ready', repreparing: Boolean(item) });
@@ -256,6 +262,34 @@ app.get('/media/:id/video.mp4', (req, res) => {
     acceptRanges: true,
     cacheControl: false,
   });
+});
+
+/** The same episode without burned-in subtitles; built on first request. */
+app.get('/media/:id/video.clean.mp4', (req, res) => {
+  const { id } = req.params;
+  if (!isMediaId(id)) return res.status(400).end();
+  const file = path.join(config.cacheDir, id, 'video.clean.mp4');
+  if (!fs.existsSync(file)) {
+    const item = library.get(id);
+    if (item) {
+      item.hasClean = false;
+      broadcast({ t: 'library' });
+      library.prepare(id, { variant: 'clean' }).catch(() => {});
+    }
+    return res.status(409).json({ error: 'not ready', repreparing: Boolean(item) });
+  }
+  res.sendFile(file, {
+    headers: { 'Cache-Control': 'public, max-age=31536000, immutable' },
+    acceptRanges: true,
+    cacheControl: false,
+  });
+});
+
+/** Alternate audio tracks, one AAC file each. */
+app.get('/media/:id/audio/:file', (req, res) => {
+  const { id, file } = req.params;
+  if (!isMediaId(id) || !/^\d+\.m4a$/.test(file)) return res.status(400).end();
+  sendIfExists(res, path.join(config.cacheDir, id, 'audio', file), { 'Cache-Control': 'public, max-age=31536000, immutable' });
 });
 
 app.get('/media/:id/poster.jpg', (req, res) => {
@@ -297,13 +331,29 @@ server.on('upgrade', (req, socket, head) => {
 const cleanName = (name) => String(name ?? '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 24) || 'Guest';
 
 wss.on('connection', (ws, url) => {
+  // A reload reuses its session id: hand the seat over before the capacity
+  // check, otherwise the ghost we just left blocks the reconnect for 30 s.
+  const sessionKey = (url.searchParams.get('s') || '').slice(0, 32);
+  if (sessionKey) {
+    for (const [other, entry] of clients) {
+      if (entry.sessionKey !== sessionKey || other === ws) continue;
+      clients.delete(other);
+      room.leave(entry.user.id);
+      try {
+        other.close(4002, 'session replaced');
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+
   if (room.full) {
     send(ws, { t: 'rejected', code: 'full', message: `Room is full (${room.maxViewers} people).` });
     return ws.close(4001, 'room full');
   }
 
   const user = { id: crypto.randomUUID().slice(0, 8), name: cleanName(url.searchParams.get('name')) };
-  clients.set(ws, { user, alive: true });
+  clients.set(ws, { user, alive: true, sessionKey });
 
   const joined = room.join(user);
   if (!joined.ok) {
@@ -365,6 +415,14 @@ wss.on('connection', (ws, url) => {
     if (msg.t === 'chat') {
       room.chat(user, msg.text);
       return;
+    }
+
+    // Any viewer can ask for the subtitle-free rendition; the library dedupes it.
+    if (msg.t === 'variant') {
+      const item = library.get(msg.id);
+      if (!item) return send(ws, { t: 'error', message: 'Unknown media' });
+      library.prepare(item.id, { variant: msg.variant === 'clean' ? 'clean' : 'styled' }).catch(() => {});
+      return undefined;
     }
 
     if (msg.t === 'select') {

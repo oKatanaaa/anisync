@@ -4,8 +4,11 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { config } from './config.js';
 import { run, ffprobeJson, detectEncoder, encoderArgs, parseProgress } from './ffmpeg.js';
+import { assToVtt } from './assToVtt.js';
+import { findSidecars } from './sidecars.js';
 
 const VIDEO_EXT = new Set(['.mkv', '.mp4', '.webm', '.avi', '.mov', '.m4v', '.ts', '.m2ts', '.flv']);
+const PROBE_VERSION = 2;
 const BITMAP_SUBS = new Set(['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'xsub']);
 const FONT_EXT = new Set(['.ttf', '.otf', '.ttc', '.woff2']);
 
@@ -34,6 +37,39 @@ export async function freeBytes(dir) {
     return Infinity;
   }
 }
+
+/** Enough ISO-639 codes to label a menu; anything else shows the raw tag. */
+const LANGUAGES = {
+  jpn: 'Japanese',
+  ja: 'Japanese',
+  eng: 'English',
+  en: 'English',
+  spa: 'Spanish',
+  es: 'Spanish',
+  fre: 'French',
+  fra: 'French',
+  fr: 'French',
+  ger: 'German',
+  deu: 'German',
+  de: 'German',
+  ita: 'Italian',
+  it: 'Italian',
+  por: 'Portuguese',
+  pt: 'Portuguese',
+  rus: 'Russian',
+  ru: 'Russian',
+  kor: 'Korean',
+  ko: 'Korean',
+  chi: 'Chinese',
+  zho: 'Chinese',
+  und: '',
+};
+
+const languageName = (code) => {
+  if (!code) return '';
+  const key = String(code).toLowerCase();
+  return LANGUAGES[key] ?? key.toUpperCase();
+};
 
 const fmtBytes = (n) => (n >= 1024 ** 3 ? `${(n / 1024 ** 3).toFixed(1)} GB` : `${Math.round(n / 1024 ** 2)} MB`);
 
@@ -80,6 +116,9 @@ export class Library {
     this.scanning = (async () => {
       await this.ensureDirs();
       const found = [];
+      // Kept per directory so sidecar tracks can be matched without another
+      // readdir for every episode.
+      const dirNames = new Map();
       const walk = async (dir, depth) => {
         if (depth > 3) return;
         let entries;
@@ -88,6 +127,7 @@ export class Library {
         } catch {
           return;
         }
+        dirNames.set(dir, entries.filter((e) => e.isFile()).map((e) => e.name));
         for (const entry of entries) {
           if (entry.name.startsWith('.')) continue;
           const full = path.join(dir, entry.name);
@@ -120,8 +160,11 @@ export class Library {
           if (previous.prepared && !(await this.#preparedMeta(previous))) {
             previous.prepared = false;
             previous.bakedSubs = false;
+            previous.hasClean = false;
             previous.progress = 0;
           }
+          // Sidecars can appear or disappear without the episode changing.
+          this.#applySidecars(previous, findSidecars(path.basename(full), dirNames.get(path.dirname(full)) ?? []));
           next.set(id, previous);
           continue;
         }
@@ -142,6 +185,7 @@ export class Library {
           fonts: [],
           prepared: false,
           preparing: false,
+          hasClean: false,
           progress: 0,
           error: null,
         };
@@ -157,9 +201,11 @@ export class Library {
         } catch (err) {
           item.error = `probe failed: ${err.message}`;
         }
+        this.#applySidecars(item, findSidecars(path.basename(item.rel), dirNames.get(path.dirname(item.path)) ?? []));
         const meta = await this.#preparedMeta(item);
         item.prepared = Boolean(meta);
         item.bakedSubs = Boolean(meta?.bakedSubs);
+        item.hasClean = Boolean(meta?.variants?.clean) && fss.existsSync(path.join(this.cacheDirFor(item.id), 'video.clean.mp4'));
       });
 
       this.items = next;
@@ -173,16 +219,23 @@ export class Library {
 
   async #probe(item) {
     const cached = await this.#readJson(path.join(this.cacheDirFor(item.id), 'probe.json'));
-    if (cached && cached.stamp === `${item.size}:${item.mtimeMs}`) return { ...cached.data, subs: cached.data.subs ?? [], fonts: [] };
+    // Bump PROBE_VERSION whenever the shape of `data` changes, or existing
+    // installs keep serving stale metadata (this is how audio tracks went
+    // missing after sidecar support landed).
+    if (cached && cached.version === PROBE_VERSION && cached.stamp === `${item.size}:${item.mtimeMs}`) {
+      return { ...cached.data, subs: cached.data.subs ?? [], audios: cached.data.audios ?? [], fonts: [] };
+    }
 
     const info = await ffprobeJson(item.path);
     const streams = info.streams || [];
     const video = streams.find((s) => s.codec_type === 'video' && s.disposition?.attached_pic !== 1);
-    const audio = streams.find((s) => s.codec_type === 'audio');
+    const audioStreams = streams.filter((s) => s.codec_type === 'audio');
+    const audio = audioStreams[0];
     const subStreams = streams.filter((s) => s.codec_type === 'subtitle');
 
     const subs = subStreams.map((s, i) => ({
       index: i,
+      stream: i,
       codec: s.codec_name,
       lang: s.tags?.language || '',
       label: s.tags?.title || s.tags?.language || `Track ${i + 1}`,
@@ -190,6 +243,16 @@ export class Library {
       default: Boolean(s.disposition?.default),
       file: `${i}.ass`,
       vtt: `${i}.vtt`,
+    }));
+
+    const audios = audioStreams.map((s, i) => ({
+      index: i,
+      stream: i,
+      codec: s.codec_name,
+      lang: (s.tags?.language || '').toLowerCase(),
+      label: s.tags?.title || languageName(s.tags?.language) || `Audio track ${i + 1}`,
+      channels: s.channels || 0,
+      muxed: i === 0,
     }));
 
     const duration = Number(info.format?.duration) || Number(video?.duration) || 0;
@@ -201,15 +264,69 @@ export class Library {
       pixFmt: video?.pix_fmt || null,
       audioCodec: audio?.codec_name || null,
       hasAudio: Boolean(audio),
+      audios,
       subs,
       title: info.format?.tags?.title?.trim() || item.title,
     };
     await fs.mkdir(this.cacheDirFor(item.id), { recursive: true });
     await fs.writeFile(
       path.join(this.cacheDirFor(item.id), 'probe.json'),
-      JSON.stringify({ stamp: `${item.size}:${item.mtimeMs}`, data }, null, 2),
+      JSON.stringify({ version: PROBE_VERSION, stamp: `${item.size}:${item.mtimeMs}`, data }, null, 2),
     );
     return data;
+  }
+
+  /**
+   * Attach external subtitle/audio files that sit beside the episode.
+   *
+   * Embedded tracks keep their indexes; sidecars are numbered after them. If the
+   * container carries no audio at all but a dub sits next to it, that dub
+   * becomes the default track so the episode is not silent.
+   */
+  #applySidecars(item, { subs: subFiles, audios: audioFiles }) {
+    const embeddedSubs = (item.embeddedSubs ?? item.subs ?? []).filter((s) => s.origin !== 'sidecar');
+    const embeddedAudios = (item.embeddedAudios ?? item.audios ?? []).filter((a) => a.origin !== 'sidecar');
+    item.embeddedSubs = embeddedSubs;
+    item.embeddedAudios = embeddedAudios;
+
+    const dir = path.dirname(item.path);
+    const subs = embeddedSubs.map((s, i) => ({ ...s, origin: s.origin ?? 'embedded', index: i, file: `${i}.ass`, vtt: `${i}.vtt` }));
+    for (const file of subFiles) {
+      const index = subs.length;
+      subs.push({
+        index,
+        origin: 'sidecar',
+        path: path.join(dir, file.name),
+        codec: file.ext.slice(1),
+        lang: file.lang,
+        label: file.label,
+        forced: file.forced,
+        bitmap: false,
+        default: false,
+        file: `${index}.ass`,
+        vtt: `${index}.vtt`,
+      });
+    }
+
+    const audios = embeddedAudios.map((a, i) => ({ ...a, origin: a.origin ?? 'embedded', index: i }));
+    for (const file of audioFiles) {
+      audios.push({
+        index: audios.length,
+        origin: 'sidecar',
+        path: path.join(dir, file.name),
+        codec: file.ext.slice(1),
+        lang: file.lang,
+        label: file.label,
+        channels: 0,
+        muxed: false,
+      });
+    }
+    // A silent video with a separate dub: the dub has to be muxed in.
+    if (audios.length && !audios.some((a) => a.muxed)) audios[0].muxed = true;
+
+    item.subs = subs;
+    item.audios = audios;
+    item.hasAudio = audios.length > 0;
   }
 
   /**
@@ -302,6 +419,26 @@ export class Library {
           // source produces a different URL, so a browser never keeps a stale
           // rendition. Seeks then come out of the local cache with no round trip.
           playbackUrl: `/media/${item.id}/video.mp4?v=${version}`,
+          // The same episode without burned-in subtitles, built on demand when
+          // someone asks for "off" or for a soft track. Null until then.
+          cleanUrl: item.prepared && !item.bakedSubs
+            ? `/media/${item.id}/video.mp4?v=${version}`
+            : item.hasClean
+              ? `/media/${item.id}/video.clean.mp4?v=${version}`
+              : null,
+          audioTracks: (item.audios || []).map((a) => ({
+            index: a.index,
+            label: a.label,
+            lang: a.lang,
+            channels: a.channels,
+            // Track 0 is inside the video file; the client must not mute it and
+            // start a second element for it.
+            muxed: Boolean(a.muxed),
+            external: a.origin === 'sidecar',
+            // Track 0 is muxed into the video, so it needs no separate file.
+            url: a.index === 0 ? null : `/media/${item.id}/audio/${a.index}.m4a?v=${version}`,
+            missing: Boolean(a.missing),
+          })),
           error: item.error,
         };
       })
@@ -316,18 +453,81 @@ export class Library {
    * Make a source file playable in a browser. Idempotent, serialised, and
    * safe to call from several clients at once.
    */
-  prepare(id) {
+  prepare(id, { variant = 'styled' } = {}) {
     const item = this.items.get(id);
     if (!item) return Promise.reject(new Error('unknown media'));
-    if (item.prepared && !item.preparing) return Promise.resolve(this.list().find((m) => m.id === id));
-    if (this.inflight.has(id)) return this.inflight.get(id);
 
-    const task = this.chain.then(() => this.#prepare(item));
+    // The subtitle-free rendition only makes sense for an episode that already
+    // plays, so build the primary one first.
+    if (variant === 'clean') {
+      if (!item.prepared) return this.prepare(id).then(() => this.prepare(id, { variant: 'clean' }));
+      if (item.hasClean && !item.preparingClean) return Promise.resolve(this.list().find((m) => m.id === id));
+      return this.#enqueue(`${id}:clean`, () => this.#prepareClean(item));
+    }
+
+    if (item.prepared && !item.preparing) return Promise.resolve(this.list().find((m) => m.id === id));
+    return this.#enqueue(id, () => this.#prepare(item));
+  }
+
+  /** Serialise heavy work; one encode at a time, deduplicated by key. */
+  #enqueue(key, work) {
+    if (this.inflight.has(key)) return this.inflight.get(key);
+    const task = this.chain.then(work);
     this.chain = task.catch(() => {}); // keep the queue alive after a failure
-    this.inflight.set(id, task);
-    const done = task.finally(() => this.inflight.delete(id));
-    this.inflight.set(id, done);
+    const done = task.finally(() => this.inflight.delete(key));
+    this.inflight.set(key, done);
     return done;
+  }
+
+  /**
+   * The same episode with no burned-in subtitles. Burned text cannot be turned
+   * off or swapped, so soft subtitle tracks need a subtitle-free picture; it is
+   * only ever built when someone actually asks for one.
+   */
+  async #prepareClean(item) {
+    const dir = this.cacheDirFor(item.id);
+    const out = path.join(dir, 'video.clean.mp4');
+    const tmp = path.join(dir, 'video.clean.partial.mp4');
+    item.preparingClean = true;
+    this.preparingIds.add(item.id);
+
+    try {
+      this.#progress(item, 1, 'clean');
+      const encoder = await detectEncoder(config.encoder);
+      const args = await this.#transcodeArgs(item, tmp, encoder, { bakeSub: null });
+      const { code, stderr } = await run('ffmpeg', args, {
+        cwd: dir,
+        stallMs: 120_000,
+        maxRuntimeMs: 6 * 3600_000,
+        onStdout: (chunk) => {
+          const p = parseProgress(chunk);
+          if (p.seconds && item.duration) this.#progress(item, 1 + 97 * Math.min(1, p.seconds / item.duration), 'clean');
+        },
+      });
+      if (code !== 0) throw new Error(`subtitle-free encode failed: ${stderr.slice(-400)}`);
+
+      await fs.rename(tmp, out);
+      await this.#markClean(item);
+      item.hasClean = true;
+      this.#progress(item, 100, 'ready');
+      this.onEvent({ type: 'variant', id: item.id, variant: 'clean' });
+      return this.list().find((m) => m.id === item.id);
+    } catch (err) {
+      item.error = err.message;
+      this.onEvent({ type: 'failed', id: item.id, message: err.message });
+      throw err;
+    } finally {
+      item.preparingClean = false;
+      this.preparingIds.delete(item.id);
+      await fs.rm(tmp, { force: true }).catch(() => {});
+    }
+  }
+
+  async #markClean(item) {
+    const file = path.join(this.cacheDirFor(item.id), 'meta.json');
+    const meta = (await this.#readJson(file)) || {};
+    meta.variants = { ...(meta.variants || {}), clean: true };
+    await fs.writeFile(file, JSON.stringify(meta, null, 2));
   }
 
   #progress(item, pct, stage) {
@@ -385,6 +585,29 @@ export class Library {
       if (code !== 0) throw new Error(`ffmpeg exited ${code}: ${stderr.slice(-600)}`);
 
       await fs.rename(tmp, out);
+
+      // Alternate audio tracks become their own AAC files: Chrome has no API for
+      // selecting an audio track inside a <video>, so the player swaps a second
+      // media element instead. Track 0 stays muxed for sample-accurate sound.
+      const extraAudio = (item.audios || []).filter((a) => a.index > 0 && a.codec !== '');
+      if (extraAudio.length) {
+        await fs.mkdir(path.join(dir, 'audio'), { recursive: true });
+        this.#progress(item, 96, 'audio');
+        await mapLimit(extraAudio, 2, async (track) => {
+          const target = path.join(dir, 'audio', `${track.index}.m4a`);
+          const input = track.origin === 'sidecar' ? track.path : item.path;
+          const map = track.origin === 'sidecar' ? '0:a:0' : `0:a:${track.stream ?? track.index}`;
+          const { code } = await run('ffmpeg', [
+            '-hide_banner', '-nostdin', '-y', '-v', 'error',
+            '-i', input,
+            '-map', map,
+            '-ac', '2', '-c:a', 'aac', '-b:a', '192k',
+            '-movflags', '+faststart', '-f', 'mp4', target,
+          ], { stallMs: 120_000 });
+          if (code !== 0) track.missing = true;
+        });
+      }
+
       // Keep the original stream list (including bitmap tracks) and merge in
       // whatever we managed to extract, so the UI can explain what is missing.
       item.subs = item.subs.map((s) => subs.find((x) => x.index === s.index) ?? s);
@@ -397,6 +620,8 @@ export class Library {
             preparedAt: new Date().toISOString(),
             encoder,
             bakedSubs: Boolean(bakeSub),
+            variants: { clean: false },
+            audios: (item.audios || []).map(({ index, label, lang, channels, missing }) => ({ index, label, lang, channels, missing: Boolean(missing) })),
             duration: item.duration,
             subs: subs.map((s) => ({ index: s.index, file: s.file, vtt: s.vtt, label: s.label })),
             fonts,
@@ -406,6 +631,7 @@ export class Library {
         ),
       );
       item.bakedSubs = Boolean(bakeSub);
+      item.hasClean = false;
       item.prepared = true;
       item.progress = 100;
       this.onEvent({ type: 'prepared', id: item.id });
@@ -425,6 +651,14 @@ export class Library {
   async #transcodeArgs(item, out, encoder, { bakeSub = null } = {}) {
     const args = ['-hide_banner', '-nostdin', '-y', '-i', item.path];
 
+    // The default audio track is normally inside the container, but a silent
+    // video with a separate dub needs that file as a second input.
+    const muxed = (item.audios || []).find((a) => a.muxed) || null;
+    const muxedFromSidecar = muxed?.origin === 'sidecar';
+    if (muxedFromSidecar) args.push('-i', muxed.path);
+
+    const muxedCodec = muxedFromSidecar ? muxed.codec : item.audioCodec;
+
     // Remux when the streams are already browser-safe: MKV -> MP4 copy is
     // seconds instead of minutes and loses nothing. Burning subtitles rules
     // that out, since it means re-encoding the picture.
@@ -432,7 +666,7 @@ export class Library {
       !bakeSub &&
       item.videoCodec === 'h264' &&
       item.pixFmt === 'yuv420p' &&
-      (!item.audioCodec || item.audioCodec === 'aac' || item.audioCodec === 'mp3');
+      (!muxedCodec || muxedCodec === 'aac' || muxedCodec === 'mp3');
 
     args.push('-map', '0:v:0');
     if (copyable) {
@@ -451,15 +685,17 @@ export class Library {
       if (filters.length) args.push('-vf', filters.join(','));
     }
 
-    if (item.hasAudio) {
-      args.push('-map', '0:a:0', '-ac', '2');
-      if (copyable && item.audioCodec === 'aac') args.push('-c:a', 'copy');
+    if (item.hasAudio && muxed) {
+      args.push('-map', muxedFromSidecar ? '1:a:0' : `0:a:${muxed.stream ?? 0}`, '-ac', '2');
+      if (copyable && muxedCodec === 'aac') args.push('-c:a', 'copy');
       else args.push('-c:a', 'aac', '-b:a', '192k');
     } else {
       args.push('-an');
     }
 
-    args.push('-sn', '-dn', '-map_metadata', '-1', '-movflags', '+faststart', '-f', 'mp4', out);
+    // Real progress on stdout, so a long encode shows a moving percentage
+    // instead of sitting at "1%".
+    args.push('-sn', '-dn', '-map_metadata', '-1', '-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', '-f', 'mp4', out);
     return args;
   }
 
@@ -469,10 +705,20 @@ export class Library {
       if (sub.bitmap) continue; // PGS/DVD bitmap subs cannot become text
       const assPath = path.join(subsDir, sub.file);
       const vttPath = path.join(subsDir, sub.vtt);
-      const ass = await run('ffmpeg', ['-hide_banner', '-nostdin', '-y', '-v', 'error', '-i', item.path, '-map', `0:s:${sub.index}`, '-c:s', 'ass', '-f', 'ass', assPath]);
+      const input = sub.origin === 'sidecar' ? sub.path : item.path;
+      const map = sub.origin === 'sidecar' ? ['-map', '0:s:0'] : ['-map', `0:s:${sub.stream ?? sub.index}`];
+      const ass = await run('ffmpeg', ['-hide_banner', '-nostdin', '-y', '-v', 'error', '-i', input, ...map, '-c:s', 'ass', '-f', 'ass', assPath]);
       if (ass.code !== 0) continue;
-      const vtt = await run('ffmpeg', ['-hide_banner', '-nostdin', '-y', '-v', 'error', '-i', item.path, '-map', `0:s:${sub.index}`, '-c:s', 'webvtt', '-f', 'webvtt', vttPath]);
-      out.push({ ...sub, hasVtt: vtt.code === 0 });
+      // Convert from the extracted ASS rather than asking ffmpeg for WebVTT:
+      // ffmpeg's muxer drops alignment, so a top-of-screen sign would render as
+      // bottom-centred dialogue in the soft track.
+      const script = await fs.readFile(assPath, 'utf8').catch(() => null);
+      if (script) {
+        await fs
+          .writeFile(vttPath, assToVtt(script, { width: item.width || 1280, height: item.height || 720 }))
+          .catch(() => {});
+      }
+      out.push({ ...sub, hasVtt: Boolean(script) });
     }
     return out;
   }

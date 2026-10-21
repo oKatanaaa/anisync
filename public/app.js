@@ -11,6 +11,12 @@ const $ = (id) => document.getElementById(id);
 
 const el = {
   video: $('video'),
+  altAudio: $('altAudio'),
+  trackMenu: $('trackMenu'),
+  subGroup: $('subGroup'),
+  subList: $('subList'),
+  audioGroup: $('audioGroup'),
+  audioList: $('audioList'),
   stage: $('stage'),
   controls: $('controls'),
   placeholder: $('placeholder'),
@@ -55,7 +61,12 @@ const state = {
   me: null,
   room: null, // {state, locked, media, users, capacity}
   media: null,
+  sourceUrl: null,
   mediaList: [],
+  tracks: { sub: 'styled', audio: 0 },
+  altActive: false,
+  userMuted: false,
+  cleanPending: null,
   users: [],
   offset: 0,
   samples: [],
@@ -115,9 +126,19 @@ function setBadge(label, tone = '') {
 // Connection
 // ---------------------------------------------------------------------------
 
+/** Identifies this tab across reloads, so a refresh never looks like a new seat. */
+function sessionId() {
+  let id = sessionStorage.getItem('anisync:session');
+  if (!id) {
+    id = Math.random().toString(36).slice(2, 10);
+    sessionStorage.setItem('anisync:session', id);
+  }
+  return id;
+}
+
 function connect(name) {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const url = `${proto}://${location.host}/ws?name=${encodeURIComponent(name)}`;
+  const url = `${proto}://${location.host}/ws?name=${encodeURIComponent(name)}&s=${sessionId()}`;
   setBadge('connecting…');
 
   const ws = new WebSocket(url);
@@ -142,6 +163,11 @@ function connect(name) {
 
   ws.onclose = (event) => {
     stopPings();
+    // Another tab took this seat over (same session id): don't fight it.
+    if (event.code === 4002) {
+      setBadge('open in another tab', 'ok');
+      return;
+    }
     if (event.code === 4001) {
       showJoin('The room is full — three seats only.');
       return;
@@ -316,16 +342,43 @@ function handle(msg) {
         const label = card.querySelector('.meta');
         if (label) label.textContent = `${msg.stage || 'working'} · ${msg.progress}%`;
       }
+      // The subtitle-free copy is being built for the episode on screen: show
+      // the progress inside the track menu, where the viewer is looking.
+      if (state.cleanPending?.id === msg.id && msg.stage === 'clean') {
+        state.cleanPending.progress = msg.progress;
+        renderTrackMenu();
+      }
       return;
     }
 
-    case 'library':
-      refreshLibrary();
-      // The rendition may have just been (re)built — a wiped cache, or an
-      // encode that finished while we were pointed at a missing file. Retry
-      // instead of leaving the player dead until a manual reload.
-      if (state.media && el.video.error) retryPlayback();
+    case 'library': {
+      // refreshLibrary is async: reading state.mediaList before it resolves
+      // would compare against the previous library and miss a new rendition.
+      refreshLibrary().then(() => {
+        // Keep the on-screen episode in step with the library: a new rendition
+        // (subtitle-free copy, rebuilt cache) changes what we should be playing.
+        const fresh = state.media ? state.mediaList.find((m) => m.id === state.media.id) : null;
+        if (fresh) {
+          state.media = { ...state.media, ...fresh };
+          const waiting = state.cleanPending?.id === fresh.id;
+          if (waiting && fresh.cleanUrl) {
+            state.cleanPending = null;
+            applyTracks();
+            setBadge('ready', 'ok');
+          } else if (waiting) {
+            renderTrackMenu();
+          }
+        }
+        // The rendition may have just been (re)built — a wiped cache, or an
+        // encode that finished while we were pointed at a missing file. Retry
+        // instead of leaving the player dead until a manual reload.
+        if (state.media?.prepared && el.video.error) {
+          state.loadRetries = 0;
+          retryPlayback();
+        }
+      });
       return;
+    }
 
     case 'lock':
       state.room && (state.room.locked = msg.locked);
@@ -444,6 +497,7 @@ function tick() {
 
   const now = serverNow();
   const position = el.video.currentTime;
+  syncAltAudio(roomState, position);
 
   if (inPreRoll(roomState, now)) {
     if (!el.video.paused) el.video.pause();
@@ -526,11 +580,6 @@ function updateTimeUI() {
 // Media + subtitles
 // ---------------------------------------------------------------------------
 
-function destroySubs() {
-  const old = el.video.querySelector('track');
-  if (old) old.remove();
-}
-
 function withRetryParam(url) {
   try {
     const parsed = new URL(url, window.location.origin);
@@ -564,8 +613,14 @@ function retryPlayback() {
  */
 function clearMedia() {
   state.media = null;
+  state.sourceUrl = null;
+  state.cleanPending = null;
   state.nudging = false;
-  destroySubs();
+  state.altActive = false;
+  el.altAudio.pause();
+  el.altAudio.removeAttribute('src');
+  detachTextTracks();
+  closeTrackMenu();
   el.video.pause();
   el.video.removeAttribute('src');
   el.video.load();
@@ -578,6 +633,7 @@ function clearMedia() {
   el.nowTitle.textContent = 'No episode loaded';
   el.nowSub.textContent = '—';
   el.subsBtn.classList.add('hidden');
+  el.subsBtn.classList.remove('on');
   updateTimeUI();
 }
 
@@ -586,66 +642,344 @@ function loadMedia(media, { force = false } = {}) {
   if (!force && state.media?.id === media.id && el.video.src) {
     state.media = media;
     updateMetaUI();
+    renderTrackMenu();
     return;
   }
 
   state.media = media;
   state.nudging = false;
-  destroySubs();
+  state.cleanPending = null;
+  state.tracks = defaultTracks(media);
   setRate(1);
 
-  el.video.pause();
-  // A forced reload gets a fresh URL: Chrome is happy to reuse the failed
-  // response for the same URL, which would make the retry pointless.
-  el.video.src = force ? withRetryParam(media.playbackUrl) : media.playbackUrl;
-  el.video.poster = media.poster || '';
-  el.video.load();
-  state.loadStartedAt = performance.now();
-  state.lastReloadAt = 0;
   el.placeholder.classList.add('hidden');
   el.stage.classList.remove('empty');
   el.stageTag.textContent = media.title;
   el.stageTag.classList.remove('hidden');
   updateMetaUI();
-  initSubs(media);
+
+  // One entry point decides which rendition and which tracks to use.
+  applyTracks({ keepPosition: false, force });
+  state.loadStartedAt = performance.now();
+  state.lastReloadAt = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Audio and subtitle tracks
+//
+// These are per viewer, never room-wide: one person may watch the dub with
+// Spanish subs while the others keep the original audio. The choice is
+// remembered per episode (and as a default for the next one).
+//
+// Burned-in subtitles are the default because they keep ASS typesetting, but
+// they cannot be switched off — so asking for "off" or another track switches to
+// a subtitle-free rendition that the server builds once, on demand.
+// ---------------------------------------------------------------------------
+
+const TRACK_PREF_KEY = 'anisync:tracks';
+
+function readTrackPrefs() {
+  try {
+    return JSON.parse(localStorage.getItem(TRACK_PREF_KEY) || '{}') || {};
+  } catch {
+    return {};
+  }
+}
+
+function saveTrackPref(mediaId, patch) {
+  const prefs = readTrackPrefs();
+  prefs[mediaId] = { ...(prefs[mediaId] || {}), ...patch };
+  prefs.last = { ...(prefs.last || {}), ...patch };
+  try {
+    localStorage.setItem(TRACK_PREF_KEY, JSON.stringify(prefs));
+  } catch {
+    /* private mode */
+  }
+}
+
+const textSubs = (media) => (media?.subs || []).filter((s) => !s.bitmap && s.vtt);
+
+function defaultTracks(media) {
+  const prefs = readTrackPrefs();
+  const saved = prefs[media.id] || prefs.last || {};
+  const subs = textSubs(media);
+
+  let sub = saved.sub;
+  if (sub === undefined) sub = media.bakedSubs ? 'styled' : subs.length ? String(subs[0].index) : 'off';
+  sub = String(sub);
+  if (sub !== 'styled' && sub !== 'off' && !subs.some((s) => String(s.index) === sub)) {
+    sub = media.bakedSubs ? 'styled' : 'off';
+  }
+
+  const audioTracks = media.audioTracks || [];
+  let audio = Number(saved.audio);
+  if (!audioTracks.some((t) => t.index === audio)) audio = 0;
+
+  return { sub, audio };
+}
+
+/** Which subtitle entries the menu offers, and in what order. */
+function subtitleOptions(media) {
+  if (!media) return [];
+  const subs = textSubs(media);
+  const options = [];
+  if (media.bakedSubs && subs.length) {
+    options.push({ value: 'styled', label: subs[0].label || 'Subtitles', note: 'styled' });
+    options.push({ value: 'off', label: 'Off' });
+    for (const s of subs.slice(1)) options.push({ value: String(s.index), label: s.label, note: s.external ? 'external' : '' });
+    return options;
+  }
+  for (const s of subs) options.push({ value: String(s.index), label: s.label, note: s.external ? 'external' : '' });
+  if (subs.length) options.push({ value: 'off', label: 'Off' });
+  return options;
+}
+
+function audioOptions(media) {
+  const tracks = media?.audioTracks || [];
+  if (tracks.length < 2) return [];
+  return tracks.map((t) => ({
+    value: t.index,
+    label: t.label,
+    note: t.muxed ? '' : t.external ? 'external' : '',
+  }));
+}
+
+/** Apply the current subtitle + audio choice to the player. */
+function applyTracks({ keepPosition = true, force = false } = {}) {
+  const media = state.media;
+  if (!media) return;
+
+  const subs = textSubs(media);
+  const choice = state.tracks.sub;
+  const wanted = choice === 'off' || choice === 'styled' ? null : subs.find((s) => String(s.index) === choice) || null;
+
+  let url = media.playbackUrl;
+  if (choice !== 'styled') {
+    if (media.cleanUrl) url = media.cleanUrl;
+    // No subtitle-free copy yet: keep showing the burned-in picture while the
+    // server builds one, rather than flashing a black frame at the viewer.
+    else requestClean(media);
+  }
+
+  setSource(url, wanted, { keepPosition, force });
+  applyAudio();
+  renderTrackMenu();
+  updateMetaUI();
 }
 
 /**
- * Subtitles are normally baked into the video by ffmpeg (`SUBTITLES=bake`),
- * which keeps ASS typesetting, signs and karaoke exactly as the release intends
- * and needs nothing from the browser. When the server is set to soft subtitles
- * we attach a plain WebVTT track instead, which the CC button can toggle.
+ * Point the <video> at a rendition, keeping the position and play state. `track`
+ * is a soft subtitle track to show, or null for none/burned-in.
  */
-function initSubs(media) {
-  const track = media.subs?.[0];
-  const baked = Boolean(media.bakedSubs);
-  el.subsBtn.classList.toggle('hidden', baked || !track);
-  el.subsBtn.classList.toggle('on', Boolean(track) && !baked);
-  if (baked || !track) return;
-  attachVttTrack(media, track);
+function setSource(url, track, { keepPosition = true, force = false } = {}) {
+  const media = state.media;
+  if (!media || !url) return;
+
+  // A forced load must reload even when the URL is unchanged: that is exactly
+  // the "retry the same episode after a rebuild" case.
+  if (!force && state.sourceUrl === url && el.video.src) {
+    showTextTrack(media, track);
+    return;
+  }
+
+  const at = keepPosition ? el.video.currentTime || 0 : 0;
+  const wasPlaying = !el.video.paused && !el.video.ended;
+
+  state.sourceUrl = url;
+  el.video.pause();
+  // A forced reload gets a fresh URL: Chrome is happy to reuse the failed
+  // response for the same URL, which would make the retry pointless.
+  el.video.src = force ? withRetryParam(url) : url;
+  el.video.poster = media.poster || '';
+  el.video.load();
+  showTextTrack(media, track);
+
+  el.video.addEventListener(
+    'loadedmetadata',
+    () => {
+      if (keepPosition && at > 0.5) el.video.currentTime = at;
+      if (wasPlaying || state.room?.state?.playing) requestPlay();
+    },
+    { once: true },
+  );
 }
 
-/** Soft subtitles: no typesetting, but the viewer can turn them off. */
-function attachVttTrack(media, track) {
-  destroySubs();
-  if (!track.vtt) return;
+function detachTextTracks() {
+  for (const node of [...el.video.querySelectorAll('track')]) node.remove();
+}
+
+/** Soft subtitles: no typesetting, but switchable and switchable-off. */
+function showTextTrack(media, track) {
+  detachTextTracks();
+  if (!track || !track.vtt) return;
   const node = document.createElement('track');
   node.kind = 'subtitles';
   node.label = track.label || 'Subtitles';
-  node.srclang = track.lang || 'jpn';
+  node.srclang = track.lang || 'und';
   node.src = `/media/${media.id}/subs/${track.vtt}`;
   node.default = true;
   el.video.appendChild(node);
-  setTimeout(() => {
-    if (el.video.textTracks[0]) el.video.textTracks[0].mode = 'showing';
-  }, 200);
+  const enable = () => {
+    const native = el.video.textTracks?.[0];
+    if (native) native.mode = 'showing';
+  };
+  node.addEventListener('load', enable);
+  setTimeout(enable, 200);
 }
 
-function toggleSubs() {
-  const native = el.video.textTracks?.[0];
-  if (!native) return;
-  native.mode = native.mode === 'showing' ? 'hidden' : 'showing';
-  el.subsBtn.classList.toggle('on', native.mode === 'showing');
+/** Alternate audio plays from a second element while the video is muted. */
+function applyAudio() {
+  const media = state.media;
+  if (!media) return;
+  const tracks = media.audioTracks || [];
+  const chosen = tracks.find((t) => t.index === state.tracks.audio) || tracks[0];
+
+  if (!chosen || chosen.muxed || !chosen.url) {
+    el.altAudio.pause();
+    el.altAudio.removeAttribute('src');
+    state.altActive = false;
+    el.video.muted = Boolean(state.userMuted) || el.video.volume === 0;
+    return;
+  }
+
+  state.altActive = true;
+  if (el.altAudio.src !== new URL(chosen.url, location.origin).href) {
+    el.altAudio.src = chosen.url;
+    el.altAudio.currentTime = el.video.currentTime || 0;
+  }
+  el.altAudio.volume = el.video.volume;
+  el.video.muted = true;
+  if (state.room?.state?.playing) el.altAudio.play().catch(() => {});
+}
+
+function syncAltAudio(roomState, position) {
+  if (!state.altActive || !el.altAudio.src) return;
+  const alt = el.altAudio;
+  if (roomState.playing) {
+    if (alt.paused && !el.video.paused) alt.play().catch(() => {});
+    if (Math.abs(alt.currentTime - position) > 0.15) alt.currentTime = position;
+    if (Math.abs(alt.playbackRate - el.video.playbackRate) > 0.001) alt.playbackRate = el.video.playbackRate;
+  } else if (!alt.paused) {
+    alt.pause();
+  }
+}
+
+/** Ask the server for the subtitle-free rendition; it is cached afterwards. */
+function requestClean(media) {
+  if (state.cleanPending?.id === media.id) return;
+  state.cleanPending = { id: media.id, progress: 0 };
+  send({ t: 'variant', id: media.id, variant: 'clean' });
+  setBadge('building subtitle-free copy…', 'ok');
+  renderTrackMenu();
+}
+
+function chooseSubtitle(value) {
+  const media = state.media;
+  if (!media) return;
+  state.tracks.sub = String(value);
+  saveTrackPref(media.id, { sub: state.tracks.sub });
+  applyTracks();
+  closeTrackMenu();
+}
+
+function chooseAudio(index) {
+  const media = state.media;
+  if (!media) return;
+  state.tracks.audio = Number(index);
+  saveTrackPref(media.id, { audio: state.tracks.audio });
+  applyTracks();
+  closeTrackMenu();
+}
+
+function trackItem({ label, note, active, onClick, disabled }) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = `track-item${active ? ' active' : ''}`;
+  button.disabled = Boolean(disabled);
+
+  button.setAttribute('aria-pressed', String(Boolean(active)));
+
+  const tick = document.createElement('span');
+  tick.className = 'tick';
+  tick.setAttribute('aria-hidden', 'true');
+  tick.textContent = '✓';
+
+  const name = document.createElement('span');
+  name.className = 'track-name';
+  name.textContent = label;
+
+  button.append(tick, name);
+
+  if (note) {
+    const hint = document.createElement('span');
+    hint.className = 'track-note';
+    hint.textContent = note;
+    button.append(hint);
+  }
+
+  button.addEventListener('click', onClick);
+  return button;
+}
+
+function renderTrackMenu() {
+  const media = state.media;
+  const subOpts = subtitleOptions(media);
+  const audioOpts = audioOptions(media);
+
+  // Nothing to switch: no button, no menu, no clutter.
+  const show = subOpts.length > 1 || audioOpts.length > 1;
+  el.subsBtn.classList.toggle('hidden', !show);
+  if (!show) {
+    closeTrackMenu();
+    return;
+  }
+
+  el.subGroup.classList.toggle('hidden', subOpts.length < 2);
+  el.audioGroup.classList.toggle('hidden', audioOpts.length < 2);
+
+  const pending = state.cleanPending?.id === media?.id ? state.cleanPending : null;
+  const pendingNote = pending ? `preparing ${Math.max(1, Math.round(pending.progress))}%` : '';
+
+  el.subList.replaceChildren(
+    ...subOpts.map((option) =>
+      trackItem({
+        label: option.label,
+        note: option.value === state.tracks.sub && pendingNote ? pendingNote : option.note,
+        active: option.value === state.tracks.sub,
+        onClick: () => chooseSubtitle(option.value),
+      }),
+    ),
+  );
+
+  el.audioList.replaceChildren(
+    ...audioOpts.map((option) =>
+      trackItem({
+        label: option.label,
+        note: option.note,
+        active: option.value === state.tracks.audio,
+        onClick: () => chooseAudio(option.value),
+      }),
+    ),
+  );
+
+  const onSoftSubs = state.tracks.sub !== 'styled';
+  el.subsBtn.classList.toggle('on', onSoftSubs || state.altActive);
+}
+
+function toggleTrackMenu() {
+  if (el.trackMenu.classList.contains('hidden')) openTrackMenu();
+  else closeTrackMenu();
+}
+
+function openTrackMenu() {
+  renderTrackMenu();
+  el.trackMenu.classList.remove('hidden');
+  el.subsBtn.setAttribute('aria-expanded', 'true');
+}
+
+function closeTrackMenu() {
+  el.trackMenu.classList.add('hidden');
+  el.subsBtn.setAttribute('aria-expanded', 'false');
 }
 
 function updateMetaUI() {
@@ -656,8 +990,12 @@ function updateMetaUI() {
   const bits = [];
   if (media.duration) bits.push(fmtTime(media.duration));
   if (media.height) bits.push(`${media.height}p`);
+  const softSubs = textSubs(media);
   if (media.bakedSubs) bits.push('subtitles burned in');
-  else if (media.subs?.length) bits.push(`${media.subs.length} soft subtitle track${media.subs.length > 1 ? 's' : ''}`);
+  else if (softSubs.length) bits.push(`${softSubs.length} subtitle track${softSubs.length > 1 ? 's' : ''}`);
+  if (media.bakedSubs && softSubs.length > 1) bits.push(`${softSubs.length - 1} switchable`);
+  const audioCount = media.audioTracks?.length || 0;
+  if (audioCount > 1) bits.push(`${audioCount} audio tracks`);
   if (media.hasBitmapSubs && !media.bakedSubs) bits.push('bitmap subs not supported');
   if (media.fonts?.length) bits.push(`${media.fonts.length} font${media.fonts.length > 1 ? 's' : ''} embedded`);
   el.nowSub.textContent = bits.join(' · ') || '—';
@@ -913,7 +1251,15 @@ async function uploadFile(file) {
         }
         toast(message, 'error');
       } else {
-        toast(`${file.name} added — preparing`);
+        // A subtitle or audio sidecar is not an episode: it attaches to whatever
+        // it is named after, so it does not start an encode.
+        let added = null;
+        try {
+          added = JSON.parse(xhr.responseText);
+        } catch {
+          /* ignore */
+        }
+        toast(added?.id ? `${file.name} added — preparing` : `${file.name} added as a track`);
       }
       resolve();
     };
@@ -974,17 +1320,39 @@ el.seek.addEventListener('change', () => {
   seekTo(Number(el.seek.value));
 });
 
-el.volume.addEventListener('input', () => {
-  el.video.volume = Number(el.volume.value);
-  el.video.muted = el.video.volume === 0;
-  localStorage.setItem('anisync:volume', el.volume.value);
-});
-el.muteBtn.addEventListener('click', () => {
-  el.video.muted = !el.video.muted;
-  el.muteBtn.classList.toggle('on', el.video.muted);
+function setVolume(value) {
+  const level = Math.max(0, Math.min(1, Number(value)));
+  el.video.volume = level;
+  el.altAudio.volume = level;
+  // The video element stays silent whenever an alternate track is in charge,
+  // otherwise a volume change would play both tracks at once.
+  el.video.muted = level === 0 || Boolean(state.userMuted) || state.altActive;
+  localStorage.setItem('anisync:volume', String(level));
+}
+
+function setMuted(muted) {
+  state.userMuted = muted;
+  // While an alternate audio track plays, the video element stays muted no
+  // matter what — otherwise both tracks would sound at once.
+  el.video.muted = muted || state.altActive;
+  el.altAudio.muted = muted;
+  el.muteBtn.classList.toggle('on', muted);
+}
+
+el.volume.addEventListener('input', () => setVolume(el.volume.value));
+el.muteBtn.addEventListener('click', () => setMuted(!state.userMuted));
+
+el.subsBtn.addEventListener('click', (event) => {
+  event.stopPropagation();
+  toggleTrackMenu();
 });
 
-el.subsBtn.addEventListener('click', toggleSubs);
+// Clicking anywhere else, or pressing Escape, closes the track menu.
+document.addEventListener('click', (event) => {
+  if (el.trackMenu.classList.contains('hidden')) return;
+  if (el.trackMenu.contains(event.target) || el.subsBtn.contains(event.target)) return;
+  closeTrackMenu();
+});
 
 el.fsBtn.addEventListener('click', () => {
   if (document.fullscreenElement) document.exitFullscreen();
@@ -1052,6 +1420,10 @@ document.addEventListener('drop', (event) => {
 });
 
 document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !el.trackMenu.classList.contains('hidden')) {
+    closeTrackMenu();
+    return;
+  }
   const typing = ['INPUT', 'TEXTAREA'].includes(event.target.tagName);
   if (typing) {
     if (event.key === 'Escape') event.target.blur();
@@ -1068,6 +1440,8 @@ document.addEventListener('keydown', (event) => {
     seekTo((el.video.currentTime || 0) - 5, { resume: state.room?.state?.playing ?? true });
   } else if (event.key === 'm') {
     el.muteBtn.click();
+  } else if (event.key === 'c') {
+    toggleTrackMenu();
   } else if (event.key === 'f') {
     el.fsBtn.click();
   }
@@ -1101,9 +1475,15 @@ el.video.addEventListener('canplay', () => {
 });
 el.video.addEventListener('error', () => {
   if (!el.video.error) return;
-  // A 409 from the server means "the file is being rebuilt" — wait for it
-  // rather than telling the user their episode is broken.
-  if (state.media && state.loadRetries < 3) {
+  // The server only answers 409 while it rebuilds a rendition. Waiting for the
+  // library event is the right move: retrying on a timer would spend the whole
+  // retry budget before a long encode finishes.
+  if (state.media && state.media.prepared === false) {
+    setBadge('rebuilding episode…', 'ok');
+    return;
+  }
+  // A 409 that has not been announced yet: ask once, then wait.
+  if (state.media && state.loadRetries < 6) {
     retryPlayback();
     return;
   }
@@ -1122,7 +1502,7 @@ el.video.addEventListener('pause', () => {
 const storedVolume = localStorage.getItem('anisync:volume');
 if (storedVolume != null) {
   el.volume.value = storedVolume;
-  el.video.volume = Number(storedVolume);
+  setVolume(storedVolume);
 }
 
 window.__sync = {
@@ -1140,7 +1520,14 @@ window.__sync = {
     readyState: el.video.readyState,
     nudging: state.nudging,
     rate: el.video.playbackRate,
-    subtitles: state.media?.bakedSubs ? 'baked' : el.video.textTracks?.length ? 'native' : 'none',
+    subtitles: !state.media
+      ? 'none'
+      : state.tracks.sub === 'styled'
+        ? 'baked'
+        : el.video.textTracks?.length
+          ? 'soft'
+          : 'off',
+    audioTrack: state.tracks.audio,
     badge: el.syncBadge.textContent,
   }),
 };

@@ -30,6 +30,23 @@ const LAUNCH_ARGS = [
   '--no-sandbox',
 ];
 
+/**
+ * The suite assumes the demo episode is ready to play. A wiped cache is a normal
+ * state for this app, so make sure rather than failing 40 checks with a timeout.
+ */
+{
+  const lib = await (await fetch(`${BASE}/api/library`)).json();
+  const demo = (lib.media || []).find((m) => m.title.includes(DEMO));
+  if (demo && !demo.prepared) {
+    await fetch(`${BASE}/api/media/${demo.id}/prepare`, { method: 'POST' });
+    for (let i = 0; i < 240; i += 1) {
+      const now = await (await fetch(`${BASE}/api/library`)).json();
+      if ((now.media || []).find((m) => m.id === demo.id)?.prepared) break;
+      await sleep(500);
+    }
+  }
+}
+
 const results = [];
 const cleanups = [];
 /** Expected failures, e.g. the 409 a scenario provokes on purpose. */
@@ -575,7 +592,12 @@ await scenario('mute and volume', async () => {
 await scenario('subtitles', async () => {
   const a = await join(await newPage(), 'Vera');
   await openEpisode(a);
-  check('no CC button when subtitles are burned in', !(await visible(a, '#subsBtn')), '', a);
+  // Burned-in subtitles cannot be removed from the picture, but the viewer can
+  // still ask for a subtitle-free rendition, so the control is offered.
+  check('the track control is offered for burned-in subtitles', await visible(a, '#subsBtn'), '', a);
+  await click(a, '#subsBtn');
+  const bakedOptions = await a.evaluate(() => [...document.querySelectorAll('#subList .track-item .track-name')].map((n) => n.textContent));
+  check('it offers the styled track and an off switch', bakedOptions.includes('Off') && bakedOptions.length >= 2, JSON.stringify(bakedOptions), a);
   check('meta explains the subtitles are baked', /burned in/i.test(await text(a, '#nowSub')), await text(a, '#nowSub'), a);
 });
 
@@ -799,7 +821,14 @@ await scenario('sync quality with three viewers', async () => {
   check('three players stay within 200 ms of each other', median < 200, `median ${median.toFixed(0)} ms`, a);
   check('the worst case stays under half a second', p95 < 500, `p95 ${p95.toFixed(0)} ms, max ${(gaps.at(-1) * 1000).toFixed(0)} ms`, a);
 
-  const rates = await Promise.all([a, b, c].map((p) => p.evaluate(() => document.getElementById('video').playbackRate)));
+  // A nudge lasts a few hundred milliseconds, so give the controllers time to
+  // come back to 1x rather than sampling during a correction.
+  let rates = [];
+  for (let i = 0; i < 25; i += 1) {
+    rates = await Promise.all([a, b, c].map((p) => p.evaluate(() => document.getElementById('video').playbackRate)));
+    if (rates.every((r) => Math.abs(r - 1) < 0.001)) break;
+    await sleep(200);
+  }
   check('corrections settle back to normal speed', rates.every((r) => Math.abs(r - 1) < 0.001), rates.join(' / '), a);
   const badges = await Promise.all([a, b, c].map((p) => text(p, '#syncBadge')));
   check('every player reports a steady state', badges.every((s) => !/lagging|behind|starting/i.test(s)), badges.join(' | '), a);
@@ -868,8 +897,235 @@ await scenario('server restart reconnects', async () => {
     a,
   );
   check('second viewer reconnects by itself', await waitFor(b, () => window.__sync.snapshot().users >= 1, 30000, 'reconnect'), '', b);
-  check('both are back in the same room', (await snap(a)).users === 2, `${(await snap(a)).users} viewers`, a);
+  check(
+    'both are back in the same room',
+    await waitFor(a, () => window.__sync.snapshot().users === 2, 10000, 'two viewers'),
+    `${(await snap(a)).users} viewers`,
+    a,
+  );
   check('nobody is stuck on a dead connection', !(await tip(a)).some((t) => /Connection lost/i.test(t)), '', a);
+});
+
+await scenario('switchable audio and subtitle tracks', async () => {
+  const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const TRACKS = 'Tracks Episode';
+  execSync(`bash ${path.join(root, 'test', 'make-tracks-fixture.sh')} ${path.join(root, 'media')}`, { stdio: 'ignore' });
+
+  cleanups.push(async () => {
+    const list = await (await fetch(`${BASE}/api/library`)).json();
+    const item = list.media.find((m) => m.title.includes(TRACKS));
+    for (const name of fs.readdirSync(path.join(root, 'media'))) {
+      if (name.startsWith(TRACKS)) fs.rmSync(path.join(root, 'media', name), { force: true });
+    }
+    if (item) fs.rmSync(path.join(root, 'cache', item.id), { recursive: true, force: true });
+    await fetch(`${BASE}/api/rescan`, { method: 'POST' });
+  });
+
+  const a = await join(await newPage(), 'Nadia');
+  const b = await join(await newPage(), 'Omar');
+  await click(a, '.tab[data-tab=library]');
+  await click(a, '#rescanBtn');
+  await sleep(1200);
+
+  // A freshly scanned file needs a transcode before it can be opened.
+  const id = await a.evaluate(async (title) => {
+    const data = await (await fetch('/api/library')).json();
+    return data.media.find((m) => m.title.includes(title))?.id ?? null;
+  }, TRACKS);
+  check('the episode was scanned with its sidecars', Boolean(id), String(id), a);
+  await a.evaluate(async (mediaId) => {
+    await fetch(`/api/media/${mediaId}/prepare`, { method: 'POST' });
+  }, id);
+  await waitFor(
+    a,
+    (title) => {
+      const card = [...document.querySelectorAll('#library .card')].find((n) => n.textContent.includes(title));
+      return Boolean(card?.querySelector('.btn.primary'));
+    },
+    90000,
+    'prepare',
+    TRACKS,
+  );
+
+  await openEpisode(a, TRACKS); // its own strict wait is covered by the checks below
+  check(
+    'the episode opens',
+    await waitFor(
+      a,
+      (mediaId) => window.__sync.snapshot().mediaId === mediaId && document.getElementById('stageTag').textContent.includes('Tracks Episode'),
+      30000,
+      'episode selected',
+      id,
+    ),
+    '',
+    a,
+  );
+  await click(a, '#playBtn');
+  await sleep(1200);
+
+  check('the track button appears when there is something to switch', await visible(a, '#subsBtn'), '', a);
+  await click(a, '#subsBtn');
+  check('the menu opens', await visible(a, '#trackMenu'), '', a);
+
+  const menu = await a.evaluate(() => ({
+    subs: [...document.querySelectorAll('#subList .track-item .track-name')].map((n) => n.textContent),
+    audio: [...document.querySelectorAll('#audioList .track-item .track-name')].map((n) => n.textContent),
+  }));
+  check('both subtitle tracks are listed', menu.subs.includes('English') && menu.subs.includes('Spanish'), JSON.stringify(menu.subs), a);
+  check('burned-in subtitles offer an off switch', menu.subs.includes('Off'), '', a);
+  check('the sidecar dub is listed as audio', menu.audio.includes('English') && menu.audio.includes('Japanese'), JSON.stringify(menu.audio), a);
+
+  // --- alternate audio ------------------------------------------------------
+  await a.evaluate(() => {
+    [...document.querySelectorAll('#audioList .track-item')]
+      .find((b) => b.querySelector('.track-name').textContent === 'English')
+      .click();
+  });
+  check(
+    'the alternate audio track starts playing',
+    await waitFor(a, () => {
+      const alt = document.getElementById('altAudio');
+      return Boolean(alt.src) && !alt.paused && document.getElementById('video').muted;
+    }, 15000, 'alternate audio'),
+    '',
+    a,
+  );
+  check(
+    'the muxed track is silenced, not layered on top',
+    await a.evaluate(() => document.getElementById('video').muted === true),
+    '',
+    a,
+  );
+
+  // Two media elements only work if they stay locked together.
+  const avGap = await a.evaluate(async () => {
+    const video = document.getElementById('video');
+    const alt = document.getElementById('altAudio');
+    let worst = 0;
+    for (let i = 0; i < 10; i += 1) {
+      worst = Math.max(worst, Math.abs(video.currentTime - alt.currentTime));
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    return worst;
+  });
+  check('the alternate audio stays in step with the picture', avGap < 0.3, `worst gap ${avGap.toFixed(3)}s`, a);
+  check(
+    'the other viewer keeps the original audio',
+    await b.evaluate(() => !document.getElementById('video').muted && !document.getElementById('altAudio').src),
+    '',
+    b,
+  );
+
+  // --- soft subtitles -------------------------------------------------------
+  await click(a, '#subsBtn');
+  await a.evaluate(() => {
+    [...document.querySelectorAll('#subList .track-item')]
+      .find((n) => n.querySelector('.track-name').textContent === 'Spanish')
+      .click();
+  });
+  check(
+    'choosing a soft track switches to the subtitle-free rendition',
+    await waitFor(a, () => document.getElementById('video').currentSrc.includes('video.clean.mp4'), 90000, 'clean rendition'),
+    '',
+    a,
+  );
+  check(
+    'the chosen subtitle track is showing',
+    await waitFor(a, () => {
+      const tracks = document.getElementById('video').textTracks;
+      return tracks.length === 1 && tracks[0].mode === 'showing';
+    }, 15000, 'text track'),
+    '',
+    a,
+  );
+  check(
+    'the other viewer still has burned-in subtitles',
+    await b.evaluate(() => document.getElementById('video').textTracks.length === 0 && !document.getElementById('video').currentSrc.includes('clean')),
+    '',
+    b,
+  );
+
+  // --- persistence ----------------------------------------------------------
+  await a.reload({ waitUntil: 'domcontentloaded' });
+  await a.waitForSelector('#nameInput', { polling: 50 });
+  await a.evaluate(() => document.querySelector('#joinForm button[type=submit]').click());
+  check(
+    'a reload gets its seat back immediately',
+    await waitFor(a, () => window.__sync?.snapshot().users >= 2, 10000, 'seat back'),
+    '',
+    a,
+  );
+  await sleep(2500);
+  check('a reload is not mistaken for a fourth viewer', (await snap(a)).users === 2, `${(await snap(a)).users} viewers`, a);
+  const remembered = await a.evaluate(() => ({
+    src: document.getElementById('video').currentSrc,
+    tracks: document.getElementById('video').textTracks.length,
+    alt: document.getElementById('altAudio').src,
+  }));
+  check('the choice survives a reload', remembered.src.includes('video.clean.mp4') && remembered.tracks === 1, JSON.stringify(remembered), a);
+  check('the audio choice survives a reload too', remembered.alt.includes('/audio/1.m4a'), remembered.alt, a);
+
+  // --- off ------------------------------------------------------------------
+  await click(a, '#subsBtn');
+  await a.evaluate(() => {
+    [...document.querySelectorAll('#subList .track-item')]
+      .find((n) => n.querySelector('.track-name').textContent === 'Off')
+      .click();
+  });
+  check(
+    'subtitles can be turned off',
+    await waitFor(a, () => document.getElementById('video').textTracks.length === 0, 15000, 'no text tracks'),
+    '',
+    a,
+  );
+  const offState = await a.evaluate(() => ({
+    sub: window.__sync.snapshot().subtitles,
+    empty: document.getElementById('stage').classList.contains('empty'),
+    src: document.getElementById('video').currentSrc.split('/').pop(),
+    toast: [...document.querySelectorAll('#toasts .toast')].map((t) => t.textContent).join(' | '),
+  }));
+  check('the state reports no subtitles', offState.sub === 'off', JSON.stringify(offState), a);
+  check('the picture and the stage survive turning subtitles off', !offState.empty && !/error|failed/i.test(offState.toast), JSON.stringify(offState), a);
+});
+
+await scenario('no track controls when there is nothing to switch', async () => {
+  const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const PLAIN = 'Plain Episode - 01.mkv';
+  execSync(
+    `ffmpeg -y -hide_banner -loglevel error -f lavfi -i testsrc2=size=320x240:rate=24 -f lavfi -i sine=frequency=440 -t 3 -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac "${path.join(root, 'media', PLAIN)}"`,
+    { stdio: 'ignore' },
+  );
+  cleanups.push(async () => {
+    const list = await (await fetch(`${BASE}/api/library`)).json();
+    const item = list.media.find((m) => m.title.startsWith('Plain Episode'));
+    fs.rmSync(path.join(root, 'media', PLAIN), { force: true });
+    if (item) fs.rmSync(path.join(root, 'cache', item.id), { recursive: true, force: true });
+    await fetch(`${BASE}/api/rescan`, { method: 'POST' });
+  });
+
+  const a = await join(await newPage(), 'Pia');
+  await click(a, '.tab[data-tab=library]');
+  await click(a, '#rescanBtn');
+  await sleep(1200);
+
+  const plainId = await a.evaluate(async () => {
+    const data = await (await fetch('/api/library')).json();
+    return data.media.find((m) => m.title.startsWith('Plain Episode'))?.id ?? null;
+  });
+  await a.evaluate(async (mediaId) => {
+    await fetch(`/api/media/${mediaId}/prepare`, { method: 'POST' });
+  }, plainId);
+  await waitFor(
+    a,
+    () => Boolean([...document.querySelectorAll('#library .card')].find((n) => n.textContent.includes('Plain Episode'))?.querySelector('.btn.primary')),
+    60000,
+    'prepare',
+  );
+
+  check('a plain episode opens', await openEpisode(a, 'Plain Episode'), '', a);
+  await sleep(600);
+  check('no track button for an episode with one audio track and no subtitles', !(await visible(a, '#subsBtn')), '', a);
+  check('the menu is not rendered either', !(await visible(a, '#trackMenu')), '', a);
 });
 
 // ---------------------------------------------------------------------------
