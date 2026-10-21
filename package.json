@@ -1,0 +1,28 @@
+{
+  "name": "anime-sync",
+  "version": "0.1.0",
+  "description": "Self-hosted synchronized anime watch party over Tailscale",
+  "main": "index.js",
+  "directories": {
+    "test": "test"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "start": "node server/index.js",
+    "test:e2e": "node test/e2e.mjs",
+    "test:unit": "node --test test/*.test.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "private": "true",
+  "dependencies": {
+    "busboy": "^1.6.0",
+    "express": "^4.22.3",
+    "ws": "^8.22.0"
+  },
+  "devDependencies": {
+    "puppeteer": "^25.15.0"
+  }
+}

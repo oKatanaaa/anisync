@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="dark" />
+<title>AniSync — watch together</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%238b5cf6'/%3E%3Cstop offset='1' stop-color='%23ec4899'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='16' fill='url(%23g)'/%3E%3Cpath d='M26 20l18 12-18 12z' fill='white'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<div class="aurora" aria-hidden="true"><span></span><span></span><span></span></div>
+
+<header class="topbar">
+  <div class="brand">
+    <div class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="18" height="18"><path d="M9 6l9 6-9 6z" fill="currentColor"/></svg>
+    </div>
+    <div class="brand-text">
+      <strong>AniSync</strong>
+      <small>synchronized playback</small>
+    </div>
+  </div>
+
+  <div class="topbar-right">
+    <button id="syncBadge" class="badge" type="button" title="Click to force a resync">
+      <i class="dot"></i><span>connecting…</span>
+    </button>
+    <span id="roomChip" class="chip">0 / 3 seats</span>
+    <div id="avatars" class="avatars" aria-label="People in the room"></div>
+  </div>
+</header>
+
+<main class="layout">
+  <section class="stage-wrap">
+    <div class="stage" id="stage">
+      <video id="video" playsinline preload="auto"></video>
+
+      <div id="placeholder" class="placeholder">
+        <div class="placeholder-inner">
+          <div class="placeholder-glyph">◍</div>
+          <h2 id="placeholderTitle">Nothing loaded yet</h2>
+          <p id="placeholderText">Open the library and pick an episode. Everything gets prepared locally, then everyone watches the same timeline.</p>
+          <button class="btn primary" id="placeholderBtn" type="button">Open library</button>
+        </div>
+      </div>
+
+      <button id="gate" class="gate hidden" type="button">
+        <span class="gate-icon">▶</span>
+        <span>Click to join playback</span>
+      </button>
+
+      <div class="stage-tag hidden" id="stageTag"></div>
+
+      <div class="controls" id="controls">
+        <input id="seek" class="seek" type="range" min="0" max="1" step="0.05" value="0" aria-label="Seek" />
+        <div class="controls-row">
+          <button id="playBtn" class="icon-btn" type="button" title="Play / pause (space)">
+            <svg class="i-play" viewBox="0 0 24 24" width="20" height="20"><path d="M8 5l12 7-12 7z" fill="currentColor"/></svg>
+            <svg class="i-pause hidden" viewBox="0 0 24 24" width="20" height="20"><path d="M7 5h4v14H7zM13 5h4v14h-4z" fill="currentColor"/></svg>
+          </button>
+          <span id="time" class="time">0:00 / 0:00</span>
+          <div class="spacer"></div>
+          <button id="subsBtn" class="icon-btn text-btn" type="button" title="Subtitles">CC</button>
+          <button id="muteBtn" class="icon-btn" type="button" title="Mute (m)">
+            <svg viewBox="0 0 24 24" width="18" height="18"><path d="M4 9v6h4l5 4V5L8 9H4z" fill="currentColor"/><path class="wave" d="M16 8.5a4.5 4.5 0 010 7" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round"/></svg>
+          </button>
+          <input id="volume" class="volume" type="range" min="0" max="1" step="0.02" value="1" aria-label="Volume" />
+          <button id="fsBtn" class="icon-btn" type="button" title="Fullscreen (f)">
+            <svg viewBox="0 0 24 24" width="18" height="18"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/></svg>
+          </button>
+        </div>
+      </div>
+    </div>
+    <div class="stage-meta">
+      <div>
+        <h1 id="nowTitle">No episode loaded</h1>
+        <p id="nowSub">—</p>
+      </div>
+      <div class="stage-meta-right">
+        <button id="lockBtn" class="btn ghost" type="button" title="Only the host can control playback">Lock controls</button>
+      </div>
+    </div>
+  </section>
+
+  <aside class="sidebar">
+    <nav class="tabs" role="tablist">
+      <button class="tab active" data-tab="chat" role="tab">Chat</button>
+      <button class="tab" data-tab="people" role="tab">People</button>
+      <button class="tab" data-tab="library" role="tab">Library</button>
+    </nav>
+
+    <div class="panel active" id="panel-chat">
+      <div id="messages" class="messages" aria-live="polite"></div>
+      <form id="chatForm" class="chat-form" autocomplete="off">
+        <input id="chatInput" type="text" maxlength="500" placeholder="Say something…" />
+        <button class="btn primary compact" type="submit">Send</button>
+      </form>
+    </div>
+
+    <div class="panel" id="panel-people">
+      <ul id="people" class="people"></ul>
+      <p class="hint">Three seats per room. Everyone can pause, seek and skip unless the host locks controls.</p>
+    </div>
+
+    <div class="panel" id="panel-library">
+      <div class="library-actions">
+        <button id="rescanBtn" class="btn ghost compact" type="button">Rescan folder</button>
+        <label class="btn ghost compact upload-label">
+          Upload
+          <input id="uploadInput" type="file" accept="video/*,.mkv,.ts" hidden />
+        </label>
+      </div>
+      <div id="uploadBar" class="upload-bar hidden"><div id="uploadFill"></div><span id="uploadLabel">uploading…</span></div>
+      <div id="library" class="library"></div>
+      <p class="hint" id="libraryHint">Drop files into <code>media/</code> on the server, then hit Rescan.</p>
+    </div>
+  </aside>
+</main>
+
+<div id="join" class="modal">
+  <form class="modal-card" id="joinForm">
+    <div class="brand-mark big" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="24" height="24"><path d="M9 6l9 6-9 6z" fill="currentColor"/></svg>
+    </div>
+    <h2>Join the room</h2>
+    <p>Pick a name your friends will recognise. Three seats, no accounts.</p>
+    <input id="nameInput" type="text" maxlength="24" placeholder="Your name" required />
+    <button class="btn primary wide" type="submit">Enter AniSync</button>
+    <p class="modal-foot" id="joinError"></p>
+  </form>
+</div>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>
