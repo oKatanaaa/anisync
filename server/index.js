@@ -235,8 +235,14 @@ app.post('/api/upload', (req, res) => {
   bus.on('close', async () => {
     // busboy finishes parsing before the last chunk is flushed to disk.
     if (writeDone) await writeDone.catch(() => {});
-    if (failure) return res.status(400).json({ error: failure });
-    if (tooBig) return res.status(413).json({ error: 'file too large' });
+    if (failure) {
+      log(`upload rejected: ${failure}`);
+      return res.status(400).json({ error: failure });
+    }
+    if (tooBig) {
+      log('upload rejected: file too large');
+      return res.status(413).json({ error: 'file too large' });
+    }
     if (!savedPath || !fs.existsSync(savedPath)) {
       return res.status(400).json({ error: 'no file received' });
     }

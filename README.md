@@ -145,12 +145,14 @@ test/
 ## Uploading
 
 Big files are the norm here, so the upload panel reports what is actually
-happening rather than a bare percentage: bytes sent of the total, current speed,
-time left, and — once the bytes have landed — the encode as a separate
-**Preparing** phase, because a 4K episode is not watchable the moment it arrives.
-Files are queued and sent one at a time (a slow link split three ways is slower
-for everyone), and the ✕ cancels the upload in flight; the server deletes its
-`.part` file when the socket dies.
+happening rather than a bare percentage: **one row per transfer**, each with its
+own bytes sent, speed, time left and ✕. Up to **three uploads run at once** and
+the rest wait in a queue ("1 more waiting") — three saturates a LAN link without
+turning the per-file ETA into noise. Once the bytes land, each row becomes a
+**Preparing** phase showing the encode ("waiting for the encoder" when another
+episode is ahead of it), because a 4K episode is not watchable the moment it
+arrives. The server still encodes one at a time, and cancelling deletes the
+`.part` file as soon as the socket dies.
 
 **Deleting** is one click on the ✕ at the right of a card, then one confirmation.
 The file is moved to `media/.trash/` rather than unlinked (a misclick on a 20 GB

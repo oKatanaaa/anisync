@@ -47,11 +47,6 @@ const el = {
   rescanBtn: $('rescanBtn'),
   uploadInput: $('uploadInput'),
   uploadBar: $('uploadBar'),
-  uploadFill: $('uploadFill'),
-  uploadPhase: $('uploadPhase'),
-  uploadName: $('uploadName'),
-  uploadDetail: $('uploadDetail'),
-  uploadCancel: $('uploadCancel'),
   join: $('join'),
   joinForm: $('joinForm'),
   joinError: $('joinError'),
@@ -354,9 +349,12 @@ function handle(msg) {
       }
       // The episode we just uploaded is being converted: keep the upload row
       // honest instead of leaving it stuck at 100%.
-      if (UPLOAD.current?.mediaId === msg.id && UPLOAD.current.phase === 'preparing') {
-        UPLOAD.current.encode = msg.progress;
-        scheduleUploadRender();
+      for (const job of UPLOAD.active) {
+        if (job.mediaId === msg.id && job.phase === 'preparing') {
+          job.encode = msg.progress;
+          job.startedEncoding = true;
+          scheduleUploadRender();
+        }
       }
       return;
     }
@@ -367,19 +365,22 @@ function handle(msg) {
       refreshLibrary().then(() => {
         // An upload finishes twice: bytes, then encoding. Only the library
         // knows about the second one.
-        const job = UPLOAD.current;
-        if (job?.mediaId && job.phase === 'preparing') {
+        for (const job of UPLOAD.active) {
+          if (!job.mediaId || job.phase !== 'preparing' || job.finishing) continue;
           const uploaded = state.mediaList.find((m) => m.id === job.mediaId);
           if (uploaded?.prepared) {
+            job.finishing = true;
             job.phase = 'done';
             job.encode = 100;
+            job.startedEncoding = true;
             renderUpload();
-            setTimeout(finishUpload, 1500);
+            setTimeout(() => finishJob(job), 1500);
           } else if (uploaded?.error) {
+            job.finishing = true;
             job.phase = 'failed';
             job.error = uploaded.error;
             renderUpload();
-            setTimeout(finishUpload, 5000);
+            setTimeout(() => finishJob(job), 5000);
           }
         }
         // Keep the on-screen episode in step with the library: a new rendition
@@ -1323,7 +1324,15 @@ function confirmDeleteRow(media) {
 // Uploads: one at a time, with an honest progress read-out
 // ---------------------------------------------------------------------------
 
-const UPLOAD = { queue: [], current: null, renderTimer: null };
+const UPLOAD = {
+  queue: [],
+  active: [],
+  // Three at a time keeps a LAN link saturated without turning the per-file
+  // speed and ETA into noise. The server still encodes one at a time.
+  maxConcurrent: 3,
+  renderTimer: null,
+  seq: 0,
+};
 
 const fmtBytes = (n) => {
   if (!Number.isFinite(n)) return '—';
@@ -1365,56 +1374,135 @@ function scheduleUploadRender() {
   }, 120);
 }
 
-function renderUpload() {
-  const job = UPLOAD.current;
-  if (!job) {
-    el.uploadBar.classList.add('hidden');
-    return;
+function uploadRow(job) {
+  const row = document.createElement('div');
+  row.className = 'upload-row';
+  row.dataset.job = String(job.id);
+
+  const top = document.createElement('div');
+  top.className = 'upload-top';
+
+  const phase = document.createElement('span');
+  phase.className = 'upload-phase';
+  phase.textContent = 'Uploading';
+
+  const name = document.createElement('span');
+  name.className = 'upload-name';
+  name.textContent = job.file.name;
+  name.title = job.file.name;
+
+  const cancel = document.createElement('button');
+  cancel.className = 'upload-cancel';
+  cancel.type = 'button';
+  cancel.textContent = '✕';
+  cancel.title = `Cancel ${job.file.name}`;
+  cancel.setAttribute('aria-label', `Cancel ${job.file.name}`);
+
+  top.append(phase, name, cancel);
+
+  const track = document.createElement('div');
+  track.className = 'upload-track';
+  const fill = document.createElement('i');
+  track.appendChild(fill);
+
+  const detail = document.createElement('div');
+  detail.className = 'upload-detail';
+
+  row.append(top, track, detail);
+  return row;
+}
+
+/** Reuse a row so a click on its ✕ is never lost to a re-render. */
+function rowFor(job) {
+  let row = el.uploadBar.querySelector(`[data-job="${job.id}"]`);
+  if (!row) {
+    row = uploadRow(job);
+    el.uploadBar.appendChild(row);
   }
-  el.uploadBar.classList.remove('hidden');
-  el.uploadName.textContent = job.file.name;
-  const queued = UPLOAD.queue.length ? ` · ${UPLOAD.queue.length} more waiting` : '';
+  return row;
+}
+
+function fillUploadRow(job, row, queued) {
+  const phase = row.querySelector('.upload-phase');
+  const fill = row.querySelector('.upload-track > i');
+  const detail = row.querySelector('.upload-detail');
+  const cancel = row.querySelector('.upload-cancel');
 
   if (job.phase === 'uploading') {
     const pct = job.total ? Math.min(100, (job.loaded / job.total) * 100) : 0;
     const speed = uploadSpeed(job);
     const remaining = speed > 0 ? (job.total - job.loaded) / speed : NaN;
-    el.uploadPhase.textContent = pct >= 99.9 ? 'Finishing' : 'Uploading';
-    el.uploadFill.style.width = `${pct}%`;
-    el.uploadDetail.textContent =
+    phase.textContent = pct >= 99.9 ? 'Finishing' : 'Uploading';
+    fill.style.width = `${pct}%`;
+    detail.textContent =
       `${fmtBytes(job.loaded)} of ${fmtBytes(job.total)}` +
       (Number.isFinite(speed) && speed > 0 ? ` · ${fmtBytes(speed)}/s` : '') +
-      (Number.isFinite(remaining) ? ` · ${fmtEta(remaining)}` : '') +
-      queued;
+      (Number.isFinite(remaining) ? ` · ${fmtEta(remaining)}` : '');
+    cancel.classList.remove('hidden');
   } else if (job.phase === 'preparing') {
-    el.uploadPhase.textContent = 'Preparing';
-    el.uploadFill.style.width = `${Math.max(1, job.encode || 0)}%`;
-    el.uploadDetail.textContent = `converting for the browser · ${Math.round(job.encode || 0)}%${queued}`;
+    phase.textContent = 'Preparing';
+    fill.style.width = `${Math.max(1, job.encode || 0)}%`;
+    // The server encodes one episode at a time, so a second upload waits its turn.
+    detail.textContent = job.startedEncoding
+      ? `converting for the browser · ${Math.round(job.encode || 0)}%`
+      : 'uploaded · waiting for the encoder';
+    cancel.classList.add('hidden');
   } else if (job.phase === 'done') {
-    el.uploadPhase.textContent = 'Ready';
-    el.uploadFill.style.width = '100%';
-    el.uploadDetail.textContent = (job.note || 'ready to play') + queued;
+    phase.textContent = 'Ready';
+    fill.style.width = '100%';
+    detail.textContent = job.note || 'ready to play';
+    cancel.classList.add('hidden');
   } else if (job.phase === 'cancelled') {
-    el.uploadPhase.textContent = 'Cancelled';
-    el.uploadFill.style.width = '0%';
-    el.uploadDetail.textContent = 'upload cancelled';
+    phase.textContent = 'Cancelled';
+    fill.style.width = '0%';
+    detail.textContent = 'upload cancelled';
+    cancel.classList.add('hidden');
   } else if (job.phase === 'failed') {
-    el.uploadPhase.textContent = 'Failed';
-    el.uploadFill.style.width = '0%';
-    el.uploadDetail.textContent = job.error || 'upload failed';
+    phase.textContent = 'Failed';
+    fill.style.width = '0%';
+    detail.textContent = job.error || 'upload failed';
+    cancel.classList.add('hidden');
   }
-  el.uploadCancel.classList.toggle('hidden', job.phase !== 'uploading');
 }
 
-function finishUpload() {
-  UPLOAD.current = null;
+function renderUpload() {
+  if (!UPLOAD.active.length) {
+    el.uploadBar.replaceChildren();
+    el.uploadBar.classList.add('hidden');
+    return;
+  }
+  el.uploadBar.classList.remove('hidden');
+
+  for (const job of UPLOAD.active) fillUploadRow(job, rowFor(job));
+
+  // Drop rows for transfers that are gone.
+  for (const row of [...el.uploadBar.querySelectorAll('.upload-row')]) {
+    if (!UPLOAD.active.some((job) => String(job.id) === row.dataset.job)) row.remove();
+  }
+
+  const queued = UPLOAD.queue.length;
+  let note = el.uploadBar.querySelector('.upload-queue');
+  if (queued) {
+    if (!note) {
+      note = document.createElement('div');
+      note.className = 'upload-queue';
+      el.uploadBar.appendChild(note);
+    }
+    note.textContent = `${queued} more waiting`;
+  } else if (note) {
+    note.remove();
+  }
+}
+
+function finishJob(job) {
+  UPLOAD.active = UPLOAD.active.filter((entry) => entry !== job);
+  job.xhr = null;
   renderUpload();
   refreshLibrary();
   pumpUploads();
 }
 
-function runUpload() {
-  const job = UPLOAD.current;
+function runUpload(job) {
   const form = new FormData();
   form.append('file', job.file, job.file.name);
 
@@ -1442,7 +1530,7 @@ function runUpload() {
       job.phase = 'failed';
       job.error = message;
       renderUpload();
-      setTimeout(finishUpload, 4000);
+      setTimeout(() => finishJob(job), 4000);
       return;
     }
     let added = null;
@@ -1457,7 +1545,9 @@ function runUpload() {
       job.phase = 'preparing';
       job.mediaId = added.id;
       job.encode = 0;
+      job.startedEncoding = false;
       renderUpload();
+      pumpUploads();
       return;
     }
     // A subtitle or audio sidecar attaches to whatever it is named after and
@@ -1466,46 +1556,59 @@ function runUpload() {
     job.note = 'added as a track';
     renderUpload();
     toast(`${job.file.name} added as a track`);
-    setTimeout(finishUpload, 1600);
+    setTimeout(() => finishJob(job), 1600);
   };
   xhr.onerror = () => {
     job.phase = 'failed';
     job.error = 'upload failed — connection lost';
     renderUpload();
     toast('upload failed', 'error');
-    setTimeout(finishUpload, 4000);
+    setTimeout(() => finishJob(job), 4000);
   };
   xhr.onabort = () => {
     job.phase = 'cancelled';
     renderUpload();
-    setTimeout(finishUpload, 1200);
+    setTimeout(() => finishJob(job), 1200);
   };
   xhr.send(form);
 }
 
+/** Start as many transfers as the concurrency limit allows. */
 function pumpUploads() {
-  if (UPLOAD.current || !UPLOAD.queue.length) return;
-  const file = UPLOAD.queue.shift();
-  UPLOAD.current = {
-    file,
-    phase: 'uploading',
-    loaded: 0,
-    total: file.size || 0,
-    samples: [],
-    encode: 0,
-  };
+  while (UPLOAD.active.length < UPLOAD.maxConcurrent && UPLOAD.queue.length) {
+    const file = UPLOAD.queue.shift();
+    const job = {
+      id: ++UPLOAD.seq,
+      file,
+      phase: 'uploading',
+      loaded: 0,
+      total: file.size || 0,
+      samples: [],
+      encode: 0,
+      startedEncoding: false,
+    };
+    UPLOAD.active.push(job);
+    runUpload(job);
+  }
   renderUpload();
-  runUpload();
 }
 
-/** Queue files; they go one at a time so a slow link is not split three ways. */
+/** Queue files; the first few start immediately, the rest follow. */
 function uploadFiles(files) {
   const list = [...(files || [])].filter(Boolean);
   if (!list.length) return;
   UPLOAD.queue.push(...list);
   pumpUploads();
-  renderUpload();
 }
+
+el.uploadBar.addEventListener('click', (event) => {
+  const button = event.target.closest('.upload-cancel');
+  if (!button) return;
+  const row = button.closest('.upload-row');
+  const job = UPLOAD.active.find((entry) => String(entry.id) === row?.dataset.job);
+  // Abort the request; the server drops its .part file on a dead socket.
+  job?.xhr?.abort();
+});
 
 // ---------------------------------------------------------------------------
 // Tabs, join modal, wiring
@@ -1638,11 +1741,6 @@ el.placeholderBtn.addEventListener('click', () => selectTab('library'));
 el.uploadInput.addEventListener('change', (event) => {
   uploadFiles(event.target.files);
   event.target.value = '';
-});
-
-el.uploadCancel.addEventListener('click', () => {
-  // Abort the request; the server drops its .part file on a dead socket.
-  UPLOAD.current?.xhr?.abort();
 });
 
 ['dragenter', 'dragover'].forEach((type) => {

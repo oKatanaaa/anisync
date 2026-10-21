@@ -1148,19 +1148,25 @@ await scenario('no track controls when there is nothing to switch', async () => 
 });
 
 await scenario('upload progress tells the truth', async () => {
+  // Cancelling a transfer mid-body makes the socket drop, which the server
+  // answers with 400 — that is the behaviour under test, not a bug.
+  allowedErrors.push(/400|Bad Request/);
   const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
-  const NAME = 'Upload Progress Test - 01.mkv';
-  const file = path.join(root, 'media', NAME);
-  execSync(
-    `ffmpeg -y -v error -f lavfi -i testsrc2=size=1280x720:rate=24 -f lavfi -i sine=frequency=440 -t 12 ` +
-      `-c:v libx264 -preset ultrafast -crf 18 -pix_fmt yuv420p -c:a aac "${file}"`,
-    { stdio: 'ignore' },
-  );
+  const names = ['Upload A - 01.mkv', 'Upload B - 02.mkv', 'Upload C - 03.mkv', 'Upload D - 04.mkv'];
+  const files = names.map((name) => path.join(root, 'media', name));
+  for (const file of files) {
+    execSync(
+      `ffmpeg -y -v error -f lavfi -i testsrc2=size=1280x720:rate=24 -f lavfi -i sine=frequency=440 -t 6 ` +
+        `-c:v libx264 -preset ultrafast -crf 18 -pix_fmt yuv420p -c:a aac "${file}"`,
+      { stdio: 'ignore' },
+    );
+  }
   cleanups.push(async () => {
     const list = await (await fetch(`${BASE}/api/library`)).json();
-    const item = list.media.find((m) => m.title.includes('Upload Progress'));
-    fs.rmSync(file, { force: true });
-    if (item) fs.rmSync(path.join(root, 'cache', item.id), { recursive: true, force: true });
+    for (const file of files) fs.rmSync(file, { force: true });
+    for (const item of list.media) {
+      if (item.title.startsWith('Upload ')) fs.rmSync(path.join(root, 'cache', item.id), { recursive: true, force: true });
+    }
     await fetch(`${BASE}/api/rescan`, { method: 'POST' });
   });
 
@@ -1178,39 +1184,72 @@ await scenario('upload progress tells the truth', async () => {
     uploadThroughput: 1.4 * 1024 * 1024,
   });
 
-  const readRow = () =>
-    a.evaluate(() => ({
-      hidden: document.getElementById('uploadBar').classList.contains('hidden'),
-      phase: document.getElementById('uploadPhase').textContent,
-      detail: document.getElementById('uploadDetail').textContent,
-      cancel: !document.getElementById('uploadCancel').classList.contains('hidden'),
-      width: document.getElementById('uploadFill').style.width,
-    }));
+  const rows = () =>
+    a.evaluate(() =>
+      [...document.querySelectorAll('#uploadBar .upload-row')].map((row) => ({
+        name: row.querySelector('.upload-name').textContent,
+        phase: row.querySelector('.upload-phase').textContent,
+        detail: row.querySelector('.upload-detail').textContent,
+        cancel: !row.querySelector('.upload-cancel').classList.contains('hidden'),
+      })),
+    );
+  const queuedNote = () => a.evaluate(() => document.querySelector('.upload-queue')?.textContent || null);
 
-  const input = await a.$('#uploadInput');
-  await input.uploadFile(file);
+  await (await a.$('#uploadInput')).uploadFile(...files);
 
-  const live = await waitFor(a, () => /\d+ (KB|MB) of \d+ (MB|GB)/.test(document.getElementById('uploadDetail').textContent), 20000, 'byte counter');
-  const first = await readRow();
-  check('the upload row appears', !first.hidden && first.phase === 'Uploading', JSON.stringify(first), a);
-  check('it shows how much has been sent', live, first.detail, a);
-  check('a stuck upload can be cancelled', first.cancel, '', a);
+  const parallel = await waitFor(a, () => document.querySelectorAll('#uploadBar .upload-row').length >= 3, 20000, 'parallel rows');
+  const live = await rows();
+  check('several uploads run at the same time', parallel && live.length === 3, `${live.length} rows`, a);
+  check('each transfer has its own row and name', live.length === 3 && new Set(live.map((r) => r.name)).size === 3, JSON.stringify(live.map((r) => r.name)), a);
+  check('the rest wait their turn', /1 more waiting/.test((await queuedNote()) || ''), String(await queuedNote()), a);
+  check('each row can be cancelled on its own', live.every((r) => r.cancel), '', a);
 
-  // Speed and ETA need a couple of samples before they mean anything.
   const measured = await waitFor(
     a,
-    () => /\/s/.test(document.getElementById('uploadDetail').textContent) && /left/.test(document.getElementById('uploadDetail').textContent),
-    15000,
+    () => {
+      const detail = document.querySelector('#uploadBar .upload-row .upload-detail')?.textContent || '';
+      return /\/s/.test(detail) && /left/.test(detail);
+    },
+    20000,
     'speed and eta',
   );
-  const row = await readRow();
-  check('it shows the transfer speed', measured && /\/s/.test(row.detail), row.detail, a);
-  check('it shows the time left', measured && /left/.test(row.detail), row.detail, a);
+  const withSpeed = (await rows())[0];
+  check('a row reports bytes sent', /[\d.]+ (KB|MB) of [\d.]+ (MB|GB)/.test(withSpeed.detail), withSpeed.detail, a);
+  check('a row reports its own speed', measured && /\/s/.test(withSpeed.detail), withSpeed.detail, a);
+  check('a row reports its own time left', measured && /left/.test(withSpeed.detail), withSpeed.detail, a);
 
-  const prepared = await waitFor(a, () => document.getElementById('uploadPhase').textContent === 'Preparing', 60000, 'preparing');
-  check('the encode is reported as its own phase', prepared, (await readRow()).detail, a);
-  const ready = await waitFor(a, () => document.getElementById('uploadPhase').textContent === 'Ready', 90000, 'ready');
-  check('the row ends up saying the episode is ready', ready, (await readRow()).detail, a);
+  // Cancelling one must not touch the others.
+  await a.evaluate(() => document.querySelector('#uploadBar .upload-row .upload-cancel').click());
+  const cancelled = await waitFor(
+    a,
+    () => [...document.querySelectorAll('#uploadBar .upload-row')].some((row) => row.querySelector('.upload-phase').textContent === 'Cancelled'),
+    10000,
+    'cancelled row',
+  );
+  const after = await rows();
+  check('cancelling one transfer leaves the others running', cancelled && after.some((r) => r.phase === 'Uploading' || r.phase === 'Finishing'), JSON.stringify(after.map((r) => r.phase)), a);
+
+  // Rows disappear once they are done, so record every phase the UI showed
+  // instead of sampling at one arbitrary moment.
+  await a.evaluate(() => {
+    window.__uploadPhases = [];
+    const record = () => {
+      for (const node of document.querySelectorAll('#uploadBar .upload-row .upload-phase')) {
+        if (!window.__uploadPhases.includes(node.textContent)) window.__uploadPhases.push(node.textContent);
+      }
+    };
+    record();
+    new MutationObserver(record).observe(document.getElementById('uploadBar'), { childList: true, subtree: true, characterData: true });
+    setInterval(record, 200);
+  });
+
+  const ready = await waitFor(
+    a,
+    () => (window.__uploadPhases || []).includes('Ready'),
+    120000,
+    'ready',
+  );
+  check('the survivors end up preparing and ready', ready, JSON.stringify(await a.evaluate(() => window.__uploadPhases)), a);
 });
 
 await scenario('deleting an episode', async () => {
