@@ -170,7 +170,7 @@ body {
 }
 .placeholder.hidden { opacity: 0; pointer-events: none; }
 .placeholder-inner { max-width: 430px; }
-.placeholder-glyph { font-size: 42px; color: var(--accent); opacity: 0.75; line-height: 1; margin-bottom: 14px; }
+.placeholder-glyph { color: var(--accent); opacity: 0.8; line-height: 1; margin-bottom: 14px; display: flex; justify-content: center; }
 .placeholder h2 { margin: 0 0 8px; font-size: 20px; font-weight: 650; }
 .placeholder p { margin: 0 0 20px; color: var(--muted); font-size: 14px; line-height: 1.55; }
 
@@ -213,6 +213,9 @@ body {
 .stage-tag.hidden { display: none; }
 
 /* --- controls ----------------------------------------------------------- */
+
+/* Nothing loaded yet: an empty transport bar would look broken. */
+.stage.empty .controls { display: none; }
 
 .controls {
   position: absolute;
@@ -529,12 +532,23 @@ body {
 
 @media (max-width: 880px) {
   body { overflow: auto; }
-  .layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 420px; height: auto; }
-  .stage { min-height: 44vh; }
+  .layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 420px); height: auto; }
+  /* Let the 16:9 ratio decide the height instead of forcing a tall box that
+     leaves the video stranded between black bars. */
+  .stage { min-height: 0; }
+  .stage-wrap { justify-content: flex-start; }
   .sidebar { max-height: 420px; }
-  .topbar { padding: 12px 14px; }
   .layout { padding: 0 14px 14px; }
-  .brand-text small { display: none; }
+  .topbar { padding: 12px 14px; flex-wrap: wrap; row-gap: 8px; }
+  .brand-text { display: none; }
+  .badge, .chip { height: 30px; padding: 0 10px; font-size: 11.5px; }
+  .avatar { width: 28px; height: 28px; font-size: 11px; }
+  .stage-meta h1 { font-size: 15px; }
+}
+
+/* Touch devices never hover, so the controls would never appear. */
+@media (hover: none) {
+  .controls { opacity: 1; transform: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {

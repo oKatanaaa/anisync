@@ -191,6 +191,9 @@ function onPong(msg) {
   if (state.samples.length > 30) state.samples.shift();
   state.offset = pickOffset(state.samples, 9);
   send({ t: 'latency', value: Math.round(sample.rtt) });
+  // The drift badge is normally driven by the playback loop, which does not run
+  // until something is loaded — so report the clock on its own until then.
+  if (!state.media) setBadge(`connected · ${Math.round(sample.rtt)}ms`, 'good');
 }
 
 const serverNow = () => performance.now() + state.offset;
@@ -514,6 +517,7 @@ function loadMedia(media) {
   state.loadStartedAt = performance.now();
   state.lastReloadAt = 0;
   el.placeholder.classList.add('hidden');
+  el.stage.classList.remove('empty');
   el.stageTag.textContent = media.title;
   el.stageTag.classList.remove('hidden');
   updateMetaUI();
@@ -639,8 +643,17 @@ function updateLockButton() {
     : 'Only the host can change this';
 }
 
+// Joining replays history *and* delivers the live "X joined" broadcast, so the
+// same entry can arrive twice. Render each id once.
+const seenEntries = new Set();
+
 function appendMessage(entry) {
   if (!entry) return;
+  if (entry.id) {
+    if (seenEntries.has(entry.id)) return;
+    seenEntries.add(entry.id);
+    if (seenEntries.size > 500) seenEntries.clear();
+  }
   const nearBottom = el.messages.scrollHeight - el.messages.scrollTop - el.messages.clientHeight < 80;
 
   const node = document.createElement('div');
