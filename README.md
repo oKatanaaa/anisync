@@ -266,6 +266,6 @@ failure modes above are covered without it.
 - **Image-based subtitles (PGS/VOBSUB) cannot be switched.** They are pictures, not text, so there is nothing to render soft or to convert; the baked-in default is all a browser can show.
 - **A subtitle-free rendition costs one extra encode.** It is built the first time anyone asks for "off" or a soft track, then cached; until it is ready the burned-in picture keeps playing.
 - **One room.** No accounts, no rooms list. The network (Tailscale) is the auth boundary.
-- **Subtitles are baked in by default.** Toggle-free, but nothing to switch off. Set `SUBTITLES=track` to serve soft WebVTT (toggleable, styling lost). Bitmap subtitles (PGS/DVD) are skipped in track mode and are not burned.
+- **Subtitles are styled by default.** Burned-in keeps typesetting, and turning them off or switching track means one extra encode of that episode (cached afterwards). Set `SUBTITLES=track` to skip the burned rendition entirely and always serve soft WebVTT.
 - **No voice chat.** Use Discord; it is better at that than this will ever be.
 - **You are the redistributor.** Keep the room to people who already have the files.
