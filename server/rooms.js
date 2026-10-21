@@ -112,6 +112,52 @@ export class Room {
   }
 
   /**
+   * The slice of room state worth keeping on disk. A process restart used to
+   * lose the episode entirely: everyone's player cleared, and pressing play
+   * answered "No media loaded".
+   */
+  persist(now = this.now()) {
+    return {
+      mediaId: this.state.mediaId || null,
+      title: this.media?.title ?? null,
+      duration: this.media?.duration ?? null,
+      playing: Boolean(this.state.playing),
+      position: this.expected(now),
+      rate: this.state.rate,
+      savedAt: now,
+    };
+  }
+
+  /**
+   * Put a saved episode back after a restart. It resumes *paused* at the last
+   * position anyone saw - deliberately not "where it would have been by now":
+   * nothing was playing while the process was down, so skipping ahead would
+   * throw the room past dialogue nobody watched.
+   */
+  restore(saved) {
+    if (!saved?.mediaId) return false;
+    const duration = Number(saved.duration) || 0;
+    let position = Math.max(0, Number(saved.position) || 0);
+    if (duration > 0) position = Math.min(position, Math.max(0, duration - 2));
+    this.media = { id: saved.mediaId, title: saved.title || 'Episode', duration };
+    this.state = {
+      ...this.state,
+      seq: this.state.seq + 1,
+      mediaId: saved.mediaId,
+      playing: false,
+      position,
+      anchor: this.now(),
+      rate: 1,
+      updatedBy: null,
+    };
+    // Give a resumed room longer than the usual minute before the empty-room
+    // sweeper rewinds it: people are still reopening their browsers after a
+    // restart, and losing the place they just got back would be insulting.
+    if (position > 0) this.idleResetMs = Math.max(this.idleResetMs, 10 * 60_000);
+    return true;
+  }
+
+  /**
    * Called on a timer by the transport. An empty room is rewound to the start
    * after a grace period, so a brief reconnect keeps its place but a room left
    * overnight starts clean for the next person.

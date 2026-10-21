@@ -66,12 +66,70 @@ const room = new Room({
   startDelayMs: config.startDelayMs,
   seekDelayMs: config.seekDelayMs,
   onEvent: (type, payload) => {
-    if (type === 'state') broadcast({ t: 'state', ...payload });
+    if (type === 'state') {
+      broadcast({ t: 'state', ...payload });
+      scheduleRoomSave();
+    }
     if (type === 'users') broadcastUsers(payload);
     if (type === 'chat') broadcast({ t: 'chat', entry: payload });
     if (type === 'lock') broadcast({ t: 'lock', locked: payload.locked });
   },
 });
+
+/**
+ * The room's episode survives a restart.
+ *
+ * Deploys, crashes and OOM kills all restart this process, and until now that
+ * wiped the room: every player cleared itself and pressing play answered
+ * "No media loaded". The snapshot is a few hundred bytes and is rewritten every
+ * few seconds while something is loaded.
+ */
+const ROOM_STATE = path.join(config.cacheDir, 'room.json');
+let roomSaveTimer = null;
+
+async function saveRoom() {
+  try {
+    const snapshot = room.persist();
+    if (!snapshot.mediaId) {
+      await fsp.rm(ROOM_STATE, { force: true });
+      return;
+    }
+    const temp = `${ROOM_STATE}.tmp`;
+    await fsp.writeFile(temp, JSON.stringify(snapshot));
+    await fsp.rename(temp, ROOM_STATE);
+  } catch {
+    /* a missing snapshot only costs a resume, never correctness */
+  }
+}
+
+let roomSavePending = null;
+
+/** Coalesce bursts of state changes into one write. */
+function scheduleRoomSave() {
+  if (roomSavePending) return;
+  roomSavePending = setTimeout(() => {
+    roomSavePending = null;
+    saveRoom();
+  }, 1500);
+}
+
+async function loadRoom() {
+  let saved = null;
+  try {
+    saved = JSON.parse(await fsp.readFile(ROOM_STATE, 'utf8'));
+  } catch {
+    return;
+  }
+  if (!saved?.mediaId) return;
+  const item = library.get(saved.mediaId);
+  if (!item) {
+    await fsp.rm(ROOM_STATE, { force: true }).catch(() => {});
+    return;
+  }
+  if (room.restore({ ...saved, title: item.title, duration: item.duration })) {
+    log(`room restored: ${item.title} at ${Math.round(room.state.position)}s`);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // HTTP
@@ -566,6 +624,12 @@ const sweeper = setInterval(() => {
 await library.ensureDirs();
 await library.scan();
 log(`library: ${library.items.size} file(s) in ${config.mediaDir}`);
+await loadRoom();
+
+// Persist the room while it matters, and stop when nothing is loaded.
+roomSaveTimer = setInterval(() => {
+  if (room.state.mediaId) saveRoom();
+}, 5000);
 
 server.listen(config.port, config.bind, async () => {
   log(`anime-sync listening on http://${config.bind}:${config.port}`);
@@ -581,6 +645,8 @@ const shutdown = (why = 'signal') => {
   log(`shutting down (${why})`);
   clearInterval(heartbeat);
   clearInterval(sweeper);
+  if (roomSaveTimer) clearInterval(roomSaveTimer);
+  saveRoom();
   if (usersTimer) clearTimeout(usersTimer);
   killAll();
   for (const ws of clients.keys()) ws.close(1001, 'server shutting down');

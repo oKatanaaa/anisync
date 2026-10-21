@@ -46,6 +46,39 @@ test('the first person in becomes host, the next one does not', () => {
   assert.equal(t.room.host().id, 'a');
 });
 
+test('an episode survives a restart, paused where it stopped', () => {
+  const first = makeRoom();
+  const user = first.join('a', 'Ana');
+  first.room.apply(user, { t: 'select', mediaId: 'abc123', title: 'Episode 04', duration: 1440 });
+  first.tick(1500); // the room holds playback briefly after a load, on purpose
+  assert.deepEqual(first.room.apply(user, { t: 'play', playing: true }), { ok: true });
+  first.tick(30_000);
+
+  // What the process writes to disk before it goes away.
+  const playing = first.room.expected();
+  assert.ok(playing > 28, `expected the room to have advanced, got ${playing}s`);
+  const saved = first.room.persist();
+  assert.equal(saved.mediaId, 'abc123');
+  assert.equal(saved.playing, true);
+  assert.equal(saved.position, playing, 'the snapshot stores where playback had reached');
+
+  // A fresh process puts it back.
+  const second = new Room({ now: () => 2_000_000 });
+  assert.equal(second.restore(saved), true);
+  assert.equal(second.state.mediaId, 'abc123');
+  assert.equal(second.state.playing, false, 'resumes paused: everyone was disconnected');
+  assert.equal(second.state.position, saved.position, 'resumes at the same second');
+  assert.equal(second.media.title, 'Episode 04');
+});
+
+test('a restore never runs past the end, and ignores an empty snapshot', () => {
+  const room = new Room({ now: () => 5_000_000 });
+  room.restore({ mediaId: 'abc123', title: 'Short', duration: 100, playing: true, position: 99, savedAt: 0 });
+  assert.equal(room.state.position, 98, 'clamped to just before the end');
+  assert.equal(new Room({}).restore(null), false);
+  assert.equal(new Room({}).restore({ mediaId: null }), false);
+});
+
 test('a fourth person is turned away', () => {
   const t = makeRoom({ maxViewers: 3 });
   t.join('a');

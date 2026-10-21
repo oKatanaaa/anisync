@@ -444,6 +444,10 @@ function setPlayIcon(playing) {
 let playPending = false;
 
 function requestPlay() {
+  if (!state.media) {
+    toast('Pick an episode from the library first');
+    return;
+  }
   if (playPending || !el.video.src) return;
   playPending = true;
   const attempt = el.video.play();
