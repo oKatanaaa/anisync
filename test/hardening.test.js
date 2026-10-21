@@ -194,6 +194,27 @@ test('a 4K HDR release is streamed at the 1080p cap, tone-mapped to SDR', async 
   assert.equal(listed.height, 2160, 'while still knowing the source size');
 });
 
+test('a scan sweeps dead .part files but never a live upload', async () => {
+  const live = path.join(mediaDir, 'Live Upload - 01.mkv.part');
+  const dead = path.join(mediaDir, 'Abandoned Upload - 01.mkv.part');
+  await fs.writeFile(live, 'mid-transfer');
+  await fs.writeFile(dead, 'crash debris');
+
+  const library = new Library({});
+  // A concurrent upload registers its temp file for the life of the transfer.
+  library.activeUploads.add(path.basename(live));
+  await library.scan();
+
+  assert.equal(fss.existsSync(live), true, 'the in-flight transfer keeps its file');
+  assert.equal(fss.existsSync(dead), false, 'genuine debris is still cleaned up');
+
+  // Once the upload finishes (or dies) the name is released and a later scan
+  // can clean it up if it is still lying around.
+  library.activeUploads.delete(path.basename(live));
+  await library.scan();
+  assert.equal(fss.existsSync(live), false, 'released temp files are swept');
+});
+
 test('a 720p rendition is built beside the 1080p one, leaving it intact', async () => {
   const name = 'Ladder Episode - 01.mkv';
   const file = path.join(mediaDir, name);

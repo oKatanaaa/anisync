@@ -96,6 +96,8 @@ export class Library {
     this.items = new Map();
     this.inflight = new Map();
     this.preparingIds = new Set();
+    /** Upload temp file names (.part) that are mid-transfer; the scan must not sweep them. */
+    this.activeUploads = new Set();
     this.scanning = null;
     // Serialise heavy work: two concurrent x264 jobs on a laptop is how you
     // make the party stutter.
@@ -380,7 +382,12 @@ export class Library {
     try {
       const libFiles = await fs.readdir(this.mediaDir);
       for (const file of libFiles) {
-        if (file.endsWith('.part')) await fs.rm(path.join(this.mediaDir, file), { force: true }).catch(() => {});
+        if (!file.endsWith('.part')) continue;
+        // An upload in flight owns its .part file. Sweeping those was deleting
+        // other transfers mid-stream, so the rename at the end hit ENOENT and
+        // the episode silently never appeared.
+        if (this.activeUploads.has(file)) continue;
+        await fs.rm(path.join(this.mediaDir, file), { force: true }).catch(() => {});
       }
     } catch {
       /* media dir may not exist yet */

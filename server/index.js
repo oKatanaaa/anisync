@@ -176,6 +176,7 @@ app.post('/api/upload', (req, res) => {
   // rather than waiting for the next scan to sweep it.
   const dropTemp = () => {
     if (!tempPath) return;
+    library.activeUploads.delete(path.basename(tempPath));
     fs.rm(tempPath, { force: true }, () => {});
     tempPath = null;
   };
@@ -197,6 +198,8 @@ app.post('/api/upload', (req, res) => {
     const temp = `${dest}.part`;
     tempPath = temp;
     savedPath = dest;
+    // Tell the scanner this .part file is a live transfer, not crash debris.
+    library.activeUploads.add(path.basename(temp));
     const out = fs.createWriteStream(temp);
     file.on('data', (chunk) => {
       received += chunk.length;
@@ -216,6 +219,8 @@ app.post('/api/upload', (req, res) => {
     });
     writeDone = new Promise((resolve) => {
       out.on('close', () => {
+        // Whether it succeeded or not, this transfer no longer owns the file.
+        library.activeUploads.delete(path.basename(temp));
         if (tooBig || failure) return resolve();
         try {
           fs.renameSync(temp, dest);
