@@ -156,13 +156,25 @@ function connect(name) {
   };
 }
 
-function send(msg) {
+let offlineToastAt = 0;
+
+/**
+ * Quiet messages are telemetry (clock pings, latency, buffering); a user's
+ * click is not quiet, because silently dropping it looks like a broken button.
+ */
+function send(msg, { quiet = false } = {}) {
   if (state.ws && state.ws.readyState === WebSocket.OPEN) {
     // Keep a short trail so sync disputes can be settled with evidence.
     (window.__sent ||= []).push({ at: Math.round(performance.now()), ...msg });
     if (window.__sent.length > 200) window.__sent.shift();
     state.ws.send(JSON.stringify(msg));
+    return true;
   }
+  if (!quiet && performance.now() - offlineToastAt > 4000) {
+    offlineToastAt = performance.now();
+    toast('Not connected — reconnecting…', 'error');
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -172,7 +184,7 @@ function send(msg) {
 function startPings() {
   stopPings();
   const ping = () => {
-    send({ t: 'ping', id: Math.random().toString(36).slice(2), cts: performance.now() });
+    send({ t: 'ping', id: Math.random().toString(36).slice(2), cts: performance.now() }, { quiet: true });
   };
   ping();
   state.pingTimer = setInterval(ping, 3000);
@@ -190,7 +202,7 @@ function onPong(msg) {
   state.samples.push(sample);
   if (state.samples.length > 30) state.samples.shift();
   state.offset = pickOffset(state.samples, 9);
-  send({ t: 'latency', value: Math.round(sample.rtt) });
+  send({ t: 'latency', value: Math.round(sample.rtt) }, { quiet: true });
   // The drift badge is normally driven by the playback loop, which does not run
   // until something is loaded — so report the clock on its own until then.
   if (!state.media) setBadge(`connected · ${Math.round(sample.rtt)}ms`, 'good');
@@ -256,6 +268,7 @@ function handle(msg) {
       const previous = state.room.state;
       state.room.state = msg;
       (window.__states ||= []).push({ at: Math.round(performance.now()), seq: msg.seq, playing: msg.playing, position: msg.position });
+      if (!msg.mediaId && state.media) clearMedia();
       if (msg.mediaId && msg.mediaId !== state.media?.id) {
         const known = state.mediaList.find((m) => m.id === msg.mediaId);
         if (known) loadMedia(known);
@@ -268,12 +281,20 @@ function handle(msg) {
       return;
     }
 
-    case 'users':
+    case 'users': {
       state.users = msg.users;
       state.room && (state.room.users = msg.users);
+      // Promotion happens server-side when the host leaves; without this the
+      // new host keeps a disabled Lock button until they reload.
+      const mine = state.me && msg.users.find((u) => u.id === state.me.id);
+      if (mine && state.me.isHost !== mine.isHost) {
+        state.me.isHost = mine.isHost;
+        updateLockButton();
+      }
       renderPeople();
       renderAvatars();
       return;
+    }
 
     case 'chat':
       appendMessage(msg.entry);
@@ -368,8 +389,13 @@ function showGate(visible) {
 function togglePlay() {
   if (!state.room || !state.media) return;
   const playing = state.room.state?.playing;
-  if (playing) send({ t: 'pause' });
-  else send({ t: 'play', position: el.video.currentTime });
+  if (playing) return send({ t: 'pause' });
+
+  const duration = el.video.duration || state.media.duration || 0;
+  const atEnd = el.video.ended || (duration > 0 && duration - el.video.currentTime < 0.6);
+  // Pressing play after the episode finished is a request to watch it again,
+  // not to resume the last half-second.
+  send({ t: 'play', position: atEnd ? 0 : el.video.currentTime });
 }
 
 /**
@@ -440,7 +466,10 @@ function tick() {
   // Give a fresh seek a moment to land before judging it.
   if (performance.now() < state.settleUntil || el.video.seeking) return updateTimeUI();
 
-  const expected = expectedPosition(roomState, now);
+  const duration = el.video.duration || state.media?.duration || 0;
+  // Past the credits the anchor keeps advancing; chasing it makes every player
+  // hard-seek into the void and snap back to 0:00. Hold at the last frame.
+  const expected = duration ? Math.min(expectedPosition(roomState, now), duration) : expectedPosition(roomState, now);
   const correction = nextCorrection({ currentTime: position, expected, nudging: state.nudging });
 
   switch (correction.action) {
@@ -497,8 +526,32 @@ function destroySubs() {
   if (old) old.remove();
 }
 
+/**
+ * The room's episode vanished from the library (deleted file, cleared cache).
+ * Put the stage back to a clean empty state instead of leaving a dead URL in
+ * the player and a generic playback error on screen.
+ */
+function clearMedia() {
+  state.media = null;
+  state.nudging = false;
+  destroySubs();
+  el.video.pause();
+  el.video.removeAttribute('src');
+  el.video.load();
+  el.stage.classList.add('empty');
+  el.stageTag.classList.add('hidden');
+  el.placeholder.classList.remove('hidden');
+  el.placeholderTitle.textContent = 'Nothing loaded yet';
+  el.placeholderText.textContent =
+    'Open the library and pick an episode. Everything gets prepared locally, then everyone watches the same timeline.';
+  el.nowTitle.textContent = 'No episode loaded';
+  el.nowSub.textContent = '—';
+  el.subsBtn.classList.add('hidden');
+  updateTimeUI();
+}
+
 function loadMedia(media) {
-  if (!media) return;
+  if (!media || !media.playbackUrl) return;
   if (state.media?.id === media.id && el.video.src) {
     state.media = media;
     updateMetaUI();
@@ -719,14 +772,17 @@ function renderLibrary() {
     card.className = 'card' + (state.media?.id === media.id ? ' playing' : '');
     card.dataset.media = media.id;
 
-    const thumb = document.createElement('img');
-    thumb.className = 'thumb';
-    thumb.loading = 'lazy';
-    thumb.alt = '';
-    thumb.src = media.poster;
-    thumb.onerror = () => {
-      thumb.style.visibility = 'hidden';
-    };
+    let thumb = null;
+    if (media.poster) {
+      thumb = document.createElement('img');
+      thumb.className = 'thumb';
+      thumb.loading = 'lazy';
+      thumb.alt = '';
+      thumb.src = media.poster;
+      thumb.onerror = () => {
+        thumb.style.visibility = 'hidden';
+      };
+    }
 
     const body = document.createElement('div');
     body.className = 'body';
@@ -787,7 +843,11 @@ function renderLibrary() {
     }
 
     body.append(title, meta, row);
-    card.append(thumb, body);
+    if (thumb) card.append(thumb, body);
+    else {
+      card.classList.add('no-thumb');
+      card.append(body);
+    }
     el.library.appendChild(card);
   }
 }
@@ -992,9 +1052,17 @@ el.video.addEventListener('loadedmetadata', () => {
   if (roomState.playing) requestPlay();
 });
 
-el.video.addEventListener('waiting', () => send({ t: 'buffering', value: true }));
-el.video.addEventListener('playing', () => send({ t: 'buffering', value: false }));
-el.video.addEventListener('canplay', () => send({ t: 'buffering', value: false }));
+// The credits roll for everyone: the room should pause, not keep counting.
+el.video.addEventListener('ended', () => {
+  if (state.room?.state?.playing) send({ t: 'ended' });
+  setPlayIcon(false);
+  el.stage.classList.add('paused');
+  setBadge('finished');
+});
+
+el.video.addEventListener('waiting', () => send({ t: 'buffering', value: true }, { quiet: true }));
+el.video.addEventListener('playing', () => send({ t: 'buffering', value: false }, { quiet: true }));
+el.video.addEventListener('canplay', () => send({ t: 'buffering', value: false }, { quiet: true }));
 el.video.addEventListener('error', () => {
   if (el.video.error) toast(`Playback error: ${el.video.error.message || 'unknown'}`, 'error');
 });

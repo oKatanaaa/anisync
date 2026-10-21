@@ -201,7 +201,10 @@ export class Library {
         prepared: item.prepared,
         preparing: item.preparing,
         progress: item.progress,
-        poster: `/media/${item.id}/poster.jpg`,
+        // Only advertise a poster once the prepare step has actually written
+        // one, otherwise every unprepared card fetches a 404 and flashes a
+        // broken image.
+        poster: item.prepared ? `/media/${item.id}/poster.jpg` : null,
         playbackUrl: `/media/${item.id}/video.mp4`,
         error: item.error,
       }))

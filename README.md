@@ -87,18 +87,35 @@ All optional, via environment variables:
 ## Testing
 
 ```bash
-npm test               # sync math: clock offset, drift decisions, 60 s simulation
-npm run test:e2e       # two real Chrome clients against a running server
+npm test          # 40 unit tests: sync math + room state machine
+npm run test:ui   # 97 checks driving the real UI in real Chrome
 ```
 
-The end-to-end test joins two clients, starts an episode, lets it play for 12 s, then asserts:
+`npm run test:ui` needs the server running. Scenarios whose name matches an
+argument run alone:
 
-- both clients stay within the p95 window of each other (aligned on the server clock, not wall clock)
-- a late joiner lands on the room position
-- pause, seek and resume propagate
-- the fourth client is refused
-- chat arrives
-- no uncaught browser errors
+```bash
+npm run test:ui -- "end of episode"
+```
+
+Every check asserts on something a person would see or hear — the seat chip, the
+drift badge, the toast text, the frame on screen — rather than on internals. The
+suite covers joining (including blank names), the library, picking an episode,
+play/pause/seek/resume propagation, late joiners, reloading mid-episode, the
+host lock and host handover, end of episode, chat (including markup injection
+and 500-character walls), keyboard shortcuts, mute/volume, subtitles, upload
+validation, long release filenames, returning from another tab, room reset, the
+three-seat cap, and surviving a server restart.
+
+Sync quality is measured with **three separate browser processes**, because
+Chrome will not buffer video in a backgrounded tab — three tabs in one browser
+measures the backgrounding heuristic, not the sync engine. Current numbers on
+loopback: median 2 ms, p95 34 ms between the three players.
+
+`test/rooms.test.js` deliberately passes a *transport-shaped* user object
+(`{id, name}`, no `isHost`) to `apply()`, because that is exactly what
+`server/index.js` does. A test that only ever handed over the stored record hid
+a bug that disabled the host lock completely.
 
 ## Layout
 
@@ -115,8 +132,9 @@ public/
   app.js      player, drift loop, chat, library UI
   style.css   dark glass UI
 test/
-  sync.test.js  unit tests
-  e2e.mjs       two-client Chrome test
+  sync.test.js     sync math: clock offset, drift decisions, 60 s simulation
+  rooms.test.js    room state machine: host, lock, capacity, end of episode, idle reset
+  ui.mjs           user-facing suite (real Chrome, real clicks, screenshots on failure)
   make-fixture.sh  builds a nasty test file (10-bit HEVC + ASS + font attachment)
 ```
 

@@ -415,6 +415,8 @@ body {
 .upload-label { display: inline-flex; align-items: center; }
 .library { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 14px 14px; display: flex; flex-direction: column; gap: 8px; }
 
+.card.no-thumb { grid-template-columns: minmax(0, 1fr); }
+
 .card {
   display: grid;
   grid-template-columns: 92px minmax(0, 1fr);

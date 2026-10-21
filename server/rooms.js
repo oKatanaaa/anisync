@@ -14,13 +14,15 @@ const RATE_VALUES = new Set([0.75, 1, 1.25, 1.5]);
  * decides who hears it, which keeps the state machine testable.
  */
 export class Room {
-  constructor({ id = 'main', maxViewers = 3, startDelayMs = 1200, seekDelayMs = 700, now = () => Date.now(), onEvent = () => {} } = {}) {
+  constructor({ id = 'main', maxViewers = 3, startDelayMs = 1200, seekDelayMs = 700, idleResetMs = 60_000, now = () => Date.now(), onEvent = () => {} } = {}) {
     this.id = id;
     this.maxViewers = maxViewers;
     this.startDelayMs = startDelayMs;
     this.seekDelayMs = seekDelayMs;
     this.now = now;
     this.onEvent = onEvent;
+    this.idleResetMs = idleResetMs;
+    this.emptySince = null;
 
     this.users = new Map();
     this.history = []; // chat + system notices, newest last
@@ -79,6 +81,7 @@ export class Room {
     const isFirst = this.users.size === 0;
     const record = { ...user, isHost: isFirst, buffering: false, latency: null, joinedAt: this.now(), ready: false };
     this.users.set(record.id, record);
+    this.emptySince = null;
     this.system(`${record.name} joined`);
     this.onEvent('users', this.usersPayload());
     return { ok: true, user: record };
@@ -96,7 +99,49 @@ export class Room {
         this.system(`${next.name} is now host`);
       }
     }
+    if (this.users.size === 0) {
+      // Nobody is watching, so the timeline must not keep running: otherwise a
+      // room left playing all evening greets the next person hours past the
+      // credits. Freeze it where it was; the sweep rewinds it later.
+      this.emptySince = this.now();
+      if (this.state.playing) {
+        this.#commit({ playing: false, position: this.expected(this.now()), anchor: this.now(), rate: 1 }, null);
+      }
+    }
     this.onEvent('users', this.usersPayload());
+  }
+
+  /**
+   * Called on a timer by the transport. An empty room is rewound to the start
+   * after a grace period, so a brief reconnect keeps its place but a room left
+   * overnight starts clean for the next person.
+   */
+  sweep(now = this.now()) {
+    if (this.users.size > 0) {
+      this.emptySince = null;
+      return false;
+    }
+    if (this.emptySince == null) {
+      this.emptySince = now;
+      return false;
+    }
+    if (now - this.emptySince < this.idleResetMs) return false;
+    if (!this.state.playing && this.state.position === 0) return false;
+    this.#commit({ playing: false, position: 0, anchor: now, rate: 1 }, null);
+    return true;
+  }
+
+  /**
+   * The file behind the loaded episode disappeared (deleted, renamed, cache
+   * cleared). Leaving the reference in place makes every joining client ask the
+   * server for `/undefined`, so the room forgets it and says why.
+   */
+  forgetMedia() {
+    if (!this.media && !this.state.mediaId) return false;
+    this.media = null;
+    this.#commit({ playing: false, position: 0, anchor: this.now(), rate: 1, mediaId: null }, null);
+    this.system('That episode is no longer in the library');
+    return true;
   }
 
   system(text) {
@@ -131,7 +176,12 @@ export class Room {
   /** Returns { ok, error } — errors are shown to the client, not thrown. */
   apply(user, msg) {
     const now = this.now();
-    const guarded = this.locked && !user.isHost;
+    // The transport passes its own connection object, which is *not* the record
+    // held in this.users (joining stores a copy). Trusting the caller's object
+    // meant isHost was always undefined here: the host could never lock the
+    // room, and buffering/latency updates were written to a throwaway object.
+    const actor = this.users.get(user?.id) ?? user;
+    const guarded = this.locked && !actor?.isHost;
     const clampPos = (p) => {
       const value = Number(p);
       if (!Number.isFinite(value) || value < 0) return 0;
@@ -144,14 +194,14 @@ export class Room {
         if (guarded) return { ok: false, error: 'Only the host can control playback right now' };
         if (!this.state.mediaId) return { ok: false, error: 'No media loaded' };
         const pos = clampPos(msg.position ?? this.expected(now));
-        this.#commit({ playing: true, position: pos, anchor: now + this.startDelayMs, rate: this.state.rate || 1 }, user);
+        this.#commit({ playing: true, position: pos, anchor: now + this.startDelayMs, rate: this.state.rate || 1 }, actor);
         return { ok: true };
       }
 
       case 'pause': {
         if (guarded) return { ok: false, error: 'Only the host can control playback right now' };
         const pos = this.expected(now);
-        this.#commit({ playing: false, position: pos, anchor: now, rate: 1 }, user);
+        this.#commit({ playing: false, position: pos, anchor: now, rate: 1 }, actor);
         return { ok: true };
       }
 
@@ -161,7 +211,7 @@ export class Room {
         const playing = Boolean(msg.resume ?? this.state.playing);
         this.#commit(
           { playing, position: pos, anchor: now + (playing ? this.seekDelayMs : 0), rate: playing ? this.state.rate || 1 : 1 },
-          user,
+          actor,
         );
         return { ok: true };
       }
@@ -171,7 +221,7 @@ export class Room {
         const rate = Number(msg.value);
         if (!RATE_VALUES.has(rate)) return { ok: false, error: 'Unsupported rate' };
         const pos = this.expected(now);
-        this.#commit({ rate, position: pos, anchor: now }, user);
+        this.#commit({ rate, position: pos, anchor: now }, actor);
         return { ok: true };
       }
 
@@ -179,27 +229,36 @@ export class Room {
         if (guarded) return { ok: false, error: 'Only the host can load media right now' };
         if (!msg.mediaId) return { ok: false, error: 'Missing mediaId' };
         this.media = { id: msg.mediaId, title: msg.title || 'Untitled', duration: Number(msg.duration) || 0 };
-        this.#commit({ playing: false, position: 0, anchor: now, rate: 1, mediaId: msg.mediaId }, user);
-        this.system(`${user.name} loaded ${this.media.title}`);
+        this.#commit({ playing: false, position: 0, anchor: now, rate: 1, mediaId: msg.mediaId }, actor);
+        this.system(`${actor?.name ?? 'someone'} loaded ${this.media.title}`);
         return { ok: true };
       }
 
       case 'lock': {
-        if (!user.isHost) return { ok: false, error: 'Only the host can lock the room' };
+        if (!actor?.isHost) return { ok: false, error: 'Only the host can lock the room' };
         this.locked = Boolean(msg.value);
         this.system(this.locked ? 'Playback locked to the host' : 'Playback unlocked');
         this.onEvent('lock', { locked: this.locked });
         return { ok: true };
       }
 
+      // The episode reached its last frame on some player. Stop the room at the
+      // credits instead of letting the anchor run past the duration forever.
+      case 'ended': {
+        if (!this.state.playing) return { ok: true };
+        const duration = this.media?.duration || this.state.position;
+        this.#commit({ playing: false, position: duration, anchor: now, rate: 1 }, actor);
+        return { ok: true };
+      }
+
       case 'buffering': {
-        user.buffering = Boolean(msg.value);
+        if (actor) actor.buffering = Boolean(msg.value);
         this.onEvent('users', this.usersPayload());
         return { ok: true };
       }
 
       case 'latency': {
-        user.latency = Number(msg.value) || null;
+        if (actor) actor.latency = Number(msg.value) || null;
         this.onEvent('users', this.usersPayload());
         return { ok: true };
       }

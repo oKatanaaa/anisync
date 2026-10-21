@@ -79,9 +79,17 @@ app.get('/api/library', (_req, res) => {
   res.json({ media: library.list(), room: room.snapshot() });
 });
 
+/** Drop a room's episode once its file is gone, so clients are not left with a dead URL. */
+function pruneRoomMedia() {
+  if (room.state.mediaId && !library.get(room.state.mediaId)) {
+    if (room.forgetMedia()) broadcast({ t: 'library' });
+  }
+}
+
 app.post('/api/rescan', async (_req, res, next) => {
   try {
     await library.scan();
+    pruneRoomMedia();
     broadcast({ t: 'library' });
     res.json({ ok: true, media: library.list() });
   } catch (err) {
@@ -136,6 +144,7 @@ app.post('/api/upload', (req, res) => {
     if (tooBig) return res.status(413).json({ error: 'file too large' });
     if (!savedPath) return res.status(400).json({ error: 'no file received' });
     await library.scan();
+    pruneRoomMedia();
     const item = [...library.items.values()].find((i) => i.path === savedPath);
     if (item) library.prepare(item.id).catch(() => {});
     broadcast({ t: 'library' });
@@ -216,7 +225,9 @@ wss.on('connection', (ws, url) => {
     t: 'welcome',
     you: { id: user.id, name: user.name, isHost: joined.user.isHost },
     ...room.snapshot(),
-    media: room.media ? library.list().find((m) => m.id === room.media.id) ?? room.media : null,
+    // Resolve through the library so the payload always carries playbackUrl and
+    // poster. `room.media` is only an {id,title,duration} note.
+    media: room.media ? library.list().find((m) => m.id === room.media.id) ?? null : null,
   });
 
   ws.on('pong', () => {
@@ -292,6 +303,12 @@ const heartbeat = setInterval(() => {
   }
 }, 30_000);
 
+// An empty room is frozen the moment the last person leaves; this rewinds it
+// once it has been quiet for a while, so nobody rejoins a stale timeline.
+const sweeper = setInterval(() => {
+  if (room.sweep()) log('room rewound after being empty');
+}, 15_000);
+
 // ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
@@ -308,6 +325,7 @@ server.listen(config.port, config.bind, async () => {
 const shutdown = () => {
   log('shutting down');
   clearInterval(heartbeat);
+  clearInterval(sweeper);
   for (const ws of clients.keys()) ws.close(1001, 'server shutting down');
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 2000);
