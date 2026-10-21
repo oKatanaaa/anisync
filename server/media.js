@@ -206,6 +206,11 @@ export class Library {
         item.prepared = Boolean(meta);
         item.bakedSubs = Boolean(meta?.bakedSubs);
         item.hasClean = Boolean(meta?.variants?.clean) && fss.existsSync(path.join(this.cacheDirFor(item.id), 'video.clean.mp4'));
+        item.altHeights = {};
+        for (const [height, kinds] of Object.entries(meta?.variants?.heights || {})) {
+          const present = (kinds || []).filter((kind) => fss.existsSync(this.#heightPath(item.id, Number(height), kind === 'clean')));
+          if (present.length) item.altHeights[height] = present;
+        }
       });
 
       this.items = next;
@@ -443,6 +448,9 @@ export class Library {
             : item.hasClean
               ? `/media/${item.id}/video.clean.mp4?v=${version}`
               : null,
+          // What the viewer can pick from: the main rendition and any lighter
+          // ones that were built (or can be built) for a weaker connection.
+          qualities: this.#qualities(item, version),
           audioTracks: (item.audios || []).map((a) => ({
             index: a.index,
             label: a.label,
@@ -464,6 +472,36 @@ export class Library {
 
   get(id) {
     return this.items.get(id) || null;
+  }
+
+  /** The rendition ladder for one episode: sharpest first. */
+  #qualities(item, version) {
+    if (!item.prepared) return [];
+    const primary = Math.min(item.height || 0, config.maxHeight) || 0;
+    const ladder = [
+      {
+        height: primary,
+        url: `/media/${item.id}/video.mp4?v=${version}`,
+        cleanUrl: item.bakedSubs
+          ? item.hasClean
+            ? `/media/${item.id}/video.clean.mp4?v=${version}`
+            : null
+          : `/media/${item.id}/video.mp4?v=${version}`,
+        ready: true,
+      },
+    ];
+    for (const height of config.altHeights) {
+      if (!(primary > height)) continue;
+      const kinds = item.altHeights?.[height] || [];
+      ladder.push({
+        height,
+        url: kinds.includes('styled') ? `/media/${item.id}/quality/${height}/video.mp4?v=${version}` : null,
+        cleanUrl: kinds.includes('clean') ? `/media/${item.id}/quality/${height}/clean.mp4?v=${version}` : null,
+        // The styled copy is what the menu checks before switching.
+        ready: kinds.includes('styled'),
+      });
+    }
+    return ladder;
   }
 
   /**
@@ -506,20 +544,47 @@ export class Library {
    * Make a source file playable in a browser. Idempotent, serialised, and
    * safe to call from several clients at once.
    */
-  prepare(id, { variant = 'styled' } = {}) {
+  prepare(id, opts = {}) {
     const item = this.items.get(id);
     if (!item) return Promise.reject(new Error('unknown media'));
 
+    // `variant: 'clean'` is the old spelling of `clean: true`.
+    const clean = Boolean(opts.clean ?? opts.variant === 'clean');
+    const height = opts.height ? Number(opts.height) : null;
+
+    // A lower-resolution copy (e.g. 720p) sits beside the main rendition; the
+    // source file is never touched, so switching back to the sharper one costs
+    // nothing.
+    if (height) {
+      const key = `${id}:h${height}${clean ? 'c' : ''}`;
+      if (this.#hasHeight(item, height, clean)) return Promise.resolve(this.list().find((m) => m.id === id));
+      // The subtitle/font extraction a variant bakes from comes from the primary
+      // prepare, so make sure that exists first.
+      const ready = item.prepared ? Promise.resolve() : this.prepare(id);
+      return ready.then(() => this.#enqueue(key, () => this.#prepareHeight(item, height, clean)));
+    }
+
     // The subtitle-free rendition only makes sense for an episode that already
     // plays, so build the primary one first.
-    if (variant === 'clean') {
-      if (!item.prepared) return this.prepare(id).then(() => this.prepare(id, { variant: 'clean' }));
+    if (clean) {
+      if (!item.prepared) return this.prepare(id).then(() => this.prepare(id, { clean: true }));
       if (item.hasClean && !item.preparingClean) return Promise.resolve(this.list().find((m) => m.id === id));
       return this.#enqueue(`${id}:clean`, () => this.#prepareClean(item));
     }
 
     if (item.prepared && !item.preparing) return Promise.resolve(this.list().find((m) => m.id === id));
     return this.#enqueue(id, () => this.#prepare(item));
+  }
+
+  /** Is this height already built (and still on disk)? */
+  #hasHeight(item, height, clean) {
+    const heights = item.altHeights || {};
+    if (!heights[height]?.includes(clean ? 'clean' : 'styled')) return false;
+    return fss.existsSync(this.#heightPath(item.id, height, clean));
+  }
+
+  #heightPath(id, height, clean) {
+    return path.join(this.cacheDirFor(id), clean ? `video.${height}.clean.mp4` : `video.${height}.mp4`);
   }
 
   /** Serialise heavy work; one encode at a time, deduplicated by key. */
@@ -580,6 +645,67 @@ export class Library {
     const file = path.join(this.cacheDirFor(item.id), 'meta.json');
     const meta = (await this.#readJson(file)) || {};
     meta.variants = { ...(meta.variants || {}), clean: true };
+    await fs.writeFile(file, JSON.stringify(meta, null, 2));
+  }
+
+  /**
+   * A second rendition at a lower resolution (720p next to 1080p), built on
+   * demand so a weak link has something lighter to fall back to. The source
+   * file is untouched and the sharper rendition stays on disk, so switching
+   * back is instant.
+   */
+  async #prepareHeight(item, height, clean) {
+    const dir = this.cacheDirFor(item.id);
+    const out = this.#heightPath(item.id, height, clean);
+    const tmp = `${out}.partial.mp4`;
+    item.preparingHeight = height;
+    this.preparingIds.add(item.id);
+
+    try {
+      this.#progress(item, 1, 'quality');
+      const encoder = await detectEncoder(config.encoder);
+      // Match the main rendition's subtitle choice, so "720p" looks like
+      // "1080p", just softer.
+      const bakeSub =
+        !clean && config.subtitles === 'bake'
+          ? ((item.subs || []).find((s) => !s.bitmap && s.file) ?? null)
+          : null;
+      const args = await this.#transcodeArgs(item, tmp, encoder, { bakeSub, height });
+      const { code, stderr } = await run('ffmpeg', args, {
+        cwd: dir,
+        stallMs: 120_000,
+        maxRuntimeMs: 6 * 3600_000,
+        onStdout: (chunk) => {
+          const p = parseProgress(chunk);
+          if (p.seconds && item.duration) this.#progress(item, 1 + 97 * Math.min(1, p.seconds / item.duration), 'quality');
+        },
+      });
+      if (code !== 0) throw new Error(`${height}p encode failed: ${stderr.slice(-400)}`);
+
+      await fs.rename(tmp, out);
+      await this.#markHeight(item, height, clean);
+      item.altHeights = { ...(item.altHeights || {}), [height]: [...new Set([...(item.altHeights?.[height] || []), clean ? 'clean' : 'styled'])] };
+      this.#progress(item, 100, 'ready');
+      this.onEvent({ type: 'variant', id: item.id, variant: 'height', height, clean });
+      return this.list().find((m) => m.id === item.id);
+    } catch (err) {
+      item.error = err.message;
+      this.onEvent({ type: 'failed', id: item.id, message: err.message });
+      throw err;
+    } finally {
+      item.preparingHeight = null;
+      this.preparingIds.delete(item.id);
+      await fs.rm(tmp, { force: true }).catch(() => {});
+    }
+  }
+
+  async #markHeight(item, height, clean) {
+    const file = path.join(this.cacheDirFor(item.id), 'meta.json');
+    const meta = (await this.#readJson(file)) || {};
+    const variants = meta.variants || {};
+    const heights = variants.heights || {};
+    heights[height] = [...new Set([...(heights[height] || []), clean ? 'clean' : 'styled'])];
+    meta.variants = { ...variants, heights };
     await fs.writeFile(file, JSON.stringify(meta, null, 2));
   }
 
@@ -701,7 +827,10 @@ export class Library {
     }
   }
 
-  async #transcodeArgs(item, out, encoder, { bakeSub = null } = {}) {
+  async #transcodeArgs(item, out, encoder, { bakeSub = null, height = null } = {}) {
+    // A lower-resolution variant scales to that height; the main rendition caps
+    // at config.maxHeight.
+    const targetHeight = height || config.maxHeight;
     const args = ['-hide_banner', '-nostdin', '-y', '-i', item.path];
 
     // The default audio track is normally inside the container, but a silent
@@ -723,7 +852,7 @@ export class Library {
       !item.hdr &&
       item.videoCodec === 'h264' &&
       item.pixFmt === 'yuv420p' &&
-      (!item.height || item.height <= config.maxHeight) &&
+      (!item.height || item.height <= targetHeight) &&
       (!muxedCodec || muxedCodec === 'aac' || muxedCodec === 'mp3');
 
     args.push('-map', '0:v:0');
@@ -733,7 +862,7 @@ export class Library {
       const filters = [];
       // Scale first so libass renders at the final resolution (and so the tone
       // map runs on the smaller frame, which is much cheaper).
-      if (item.height > config.maxHeight) filters.push(`scale=-2:${config.maxHeight}`);
+      if (item.height > targetHeight) filters.push(`scale=-2:${targetHeight}`);
       // HDR10 / HLG / Dolby Vision -> BT.709 SDR. zscale does the linearisation
       // and primaries conversion, tonemap does the curve; doing this at all is
       // the difference between "washed out grey" and a normal-looking episode.

@@ -38,6 +38,11 @@
       <!-- Alternate audio tracks play here while the video element is muted. -->
       <audio id="altAudio" preload="auto"></audio>
 
+      <div class="track-menu quality-menu hidden" id="qualityMenu" role="dialog" aria-label="Video quality">
+        <p class="track-title">Quality</p>
+        <div class="track-list" id="qualityList"></div>
+        <p class="track-hint" id="qualityHint"></p>
+      </div>
       <div class="track-menu hidden" id="trackMenu" role="dialog" aria-label="Audio and subtitles">
         <div class="track-group" id="subGroup">
           <p class="track-title">Subtitles</p>
@@ -47,6 +52,7 @@
           <p class="track-title">Audio</p>
           <div class="track-list" id="audioList"></div>
         </div>
+
       </div>
 
       <div id="placeholder" class="placeholder">
@@ -79,6 +85,9 @@
           </button>
           <span id="time" class="time">0:00 / 0:00</span>
           <div class="spacer"></div>
+          <button id="qualityBtn" class="icon-btn text-btn hidden" type="button" title="Video quality" aria-haspopup="true" aria-expanded="false">
+            <span id="qualityLabel">1080p</span><span class="caret" aria-hidden="true">▾</span>
+          </button>
           <button id="subsBtn" class="icon-btn text-btn hidden" type="button" title="Audio and subtitles (c)" aria-haspopup="true" aria-expanded="false">
             CC<span class="caret" aria-hidden="true">▾</span>
           </button>

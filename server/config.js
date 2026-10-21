@@ -36,5 +36,13 @@ export const config = {
 
   /** Cap the stored rendition; 1080p is plenty for a laptop screen. */
   maxHeight: num(process.env.MAX_HEIGHT, 1080),
+  /**
+   * Extra renditions a viewer can switch to when the sharp one strains the
+   * network. Built on demand, stored beside the main one, never replacing it.
+   */
+  altHeights: (process.env.ALT_HEIGHTS || '720')
+    .split(',')
+    .map((value) => Number(value.trim()))
+    .filter((value) => Number.isFinite(value) && value > 0),
   crf: num(process.env.CRF, 21),
 };

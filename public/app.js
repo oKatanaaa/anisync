@@ -17,6 +17,11 @@ const el = {
   subList: $('subList'),
   audioGroup: $('audioGroup'),
   audioList: $('audioList'),
+  qualityBtn: $('qualityBtn'),
+  qualityLabel: $('qualityLabel'),
+  qualityMenu: $('qualityMenu'),
+  qualityList: $('qualityList'),
+  qualityHint: $('qualityHint'),
   stage: $('stage'),
   controls: $('controls'),
   placeholder: $('placeholder'),
@@ -343,9 +348,10 @@ function handle(msg) {
       }
       // The subtitle-free copy is being built for the episode on screen: show
       // the progress inside the track menu, where the viewer is looking.
-      if (state.cleanPending?.id === msg.id && msg.stage === 'clean') {
+      if (state.cleanPending?.id === msg.id && (msg.stage === 'clean' || msg.stage === 'quality')) {
         state.cleanPending.progress = msg.progress;
         renderTrackMenu();
+        renderQualityMenu();
       }
       // The episode we just uploaded is being converted: keep the upload row
       // honest instead of leaving it stuck at 100%.
@@ -388,13 +394,20 @@ function handle(msg) {
         const fresh = state.media ? state.mediaList.find((m) => m.id === state.media.id) : null;
         if (fresh) {
           state.media = { ...state.media, ...fresh };
-          const waiting = state.cleanPending?.id === fresh.id;
-          if (waiting && fresh.cleanUrl) {
-            state.cleanPending = null;
-            applyTracks();
-            setBadge('ready', 'ok');
-          } else if (waiting) {
-            renderTrackMenu();
+          const pending = state.cleanPending;
+          const waiting = pending && pending.id === fresh.id;
+          if (waiting) {
+            // The rendition we asked for now exists: switch to it and drop the
+            // "preparing" state.
+            const quality = (fresh.qualities || []).find((q) => q.height === (pending.height ?? (fresh.qualities || [])[0]?.height));
+            const done = pending.clean ? Boolean(quality?.cleanUrl) : Boolean(quality?.url);
+            if (done) {
+              state.cleanPending = null;
+              applyTracks();
+              setBadge('ready', 'ok');
+            } else {
+              renderTrackMenu();
+            }
           }
         }
         // The rendition may have just been (re)built — a wiped cache, or an
@@ -649,6 +662,8 @@ function clearMedia() {
   el.altAudio.removeAttribute('src');
   detachTextTracks();
   closeTrackMenu();
+  closeQualityMenu();
+  el.qualityBtn.classList.add('hidden');
   el.video.pause();
   el.video.removeAttribute('src');
   el.video.load();
@@ -743,8 +758,20 @@ function defaultTracks(media) {
   let audio = Number(saved.audio);
   if (!audioTracks.some((t) => t.index === audio)) audio = 0;
 
-  return { sub, audio };
+  // Quality: default to the sharpest rendition, honour a remembered choice only
+  // if this episode still offers it.
+  const ladder = media.qualities || [];
+  let quality = Number(saved.quality);
+  if (!ladder.some((q) => q.height === quality)) quality = ladder[0]?.height ?? 0;
+
+  return { sub, audio, quality };
 }
+
+/** The rendition the viewer picked, falling back to the sharpest one. */
+const chosenQuality = (media) => {
+  const ladder = media?.qualities || [];
+  return ladder.find((q) => q.height === state.tracks.quality) || ladder[0] || null;
+};
 
 /** Which subtitle entries the menu offers, and in what order. */
 function subtitleOptions(media) {
@@ -772,6 +799,27 @@ function audioOptions(media) {
   }));
 }
 
+/** The rendition ladder as menu entries, sharpest first. */
+function qualityOptions(media) {
+  const ladder = media?.qualities || [];
+  return ladder.map((quality, index) => ({
+    height: quality.height,
+    label: `${quality.height}p`,
+    active: quality.height === state.tracks.quality,
+    note: index === 0 ? 'sharpest' : quality.ready ? '' : 'build on demand',
+  }));
+}
+
+/** Pick a rendition; a missing one is built and switched to when ready. */
+function chooseQuality(height) {
+  const media = state.media;
+  if (!media) return;
+  state.tracks.quality = Number(height);
+  saveTrackPref(media.id, { quality: state.tracks.quality });
+  applyTracks();
+  closeTrackMenu();
+}
+
 /** Apply the current subtitle + audio choice to the player. */
 function applyTracks({ keepPosition = true, force = false } = {}) {
   const media = state.media;
@@ -781,17 +829,29 @@ function applyTracks({ keepPosition = true, force = false } = {}) {
   const choice = state.tracks.sub;
   const wanted = choice === 'off' || choice === 'styled' ? null : subs.find((s) => String(s.index) === choice) || null;
 
+  // A rendition is (quality x subtitle mode): 1080p with burned subs, 720p with
+  // none, and so on. Missing combinations are built on demand while whatever is
+  // already playing keeps playing.
+  const quality = chosenQuality(media);
+  const wantsClean = choice !== 'styled';
   let url = media.playbackUrl;
-  if (choice !== 'styled') {
+  if (quality) {
+    const wanted = wantsClean ? quality.cleanUrl : quality.url;
+    if (wanted) {
+      url = wanted;
+    } else {
+      url = wantsClean ? quality.url || media.playbackUrl : media.playbackUrl;
+      requestBuild(media, { height: quality.height, clean: wantsClean });
+    }
+  } else if (wantsClean) {
     if (media.cleanUrl) url = media.cleanUrl;
-    // No subtitle-free copy yet: keep showing the burned-in picture while the
-    // server builds one, rather than flashing a black frame at the viewer.
-    else requestClean(media);
+    else requestBuild(media, { clean: true });
   }
 
   setSource(url, wanted, { keepPosition, force });
   applyAudio();
   renderTrackMenu();
+  renderQualityMenu();
   updateMetaUI();
 }
 
@@ -893,11 +953,16 @@ function syncAltAudio(roomState, position) {
 }
 
 /** Ask the server for the subtitle-free rendition; it is cached afterwards. */
-function requestClean(media) {
-  if (state.cleanPending?.id === media.id) return;
-  state.cleanPending = { id: media.id, progress: 0 };
-  send({ t: 'variant', id: media.id, variant: 'clean' });
-  setBadge('building subtitle-free copy…', 'ok');
+function requestBuild(media, { height = null, clean = false } = {}) {
+  const pending = state.cleanPending;
+  if (pending?.id === media.id && pending.height === height && pending.clean === clean) return;
+  state.cleanPending = { id: media.id, height, clean, progress: 0 };
+  fetch(`/api/media/${media.id}/prepare`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ height, clean }),
+  }).catch(() => {});
+  setBadge(height ? `building ${height}p…` : 'building subtitle-free copy…', 'ok');
   renderTrackMenu();
 }
 
@@ -1010,6 +1075,57 @@ function closeTrackMenu() {
   el.subsBtn.setAttribute('aria-expanded', 'false');
 }
 
+function renderQualityMenu() {
+  const media = state.media;
+  const options = qualityOptions(media);
+  // Nothing to choose between: no pill, no menu.
+  const show = options.length > 1;
+  el.qualityBtn.classList.toggle('hidden', !show);
+  if (!show) {
+    closeQualityMenu();
+    return;
+  }
+
+  const current = options.find((option) => option.active) || options[0];
+  el.qualityLabel.textContent = current.label;
+  el.qualityBtn.classList.toggle('on', options.indexOf(current) > 0);
+
+  const pending = state.cleanPending?.id === media?.id ? state.cleanPending : null;
+  el.qualityList.replaceChildren(
+    ...options.map((option) =>
+      trackItem({
+        label: option.label,
+        note:
+          pending?.height === option.height
+            ? `preparing ${Math.max(1, Math.round(pending.progress))}%`
+            : option.note,
+        active: option.active,
+        onClick: () => chooseQuality(option.height),
+      }),
+    ),
+  );
+  const note = options.find((option) => !option.active && option.note === 'build on demand');
+  el.qualityHint.textContent = note
+    ? `Building ${note.label} takes a minute or two; what is playing keeps playing.`
+    : '';
+}
+
+function toggleQualityMenu() {
+  if (el.qualityMenu.classList.contains('hidden')) {
+    renderQualityMenu();
+    closeTrackMenu();
+    el.qualityMenu.classList.remove('hidden');
+    el.qualityBtn.setAttribute('aria-expanded', 'true');
+  } else {
+    closeQualityMenu();
+  }
+}
+
+function closeQualityMenu() {
+  el.qualityMenu.classList.add('hidden');
+  el.qualityBtn?.setAttribute('aria-expanded', 'false');
+}
+
 function updateMetaUI() {
   const media = state.media;
   if (!media) return;
@@ -1019,7 +1135,8 @@ function updateMetaUI() {
   if (media.duration) bits.push(fmtTime(media.duration));
   // Report what is being streamed, not what the file is: a 4K release is
   // served at the 1080p cap and saying "2160p" would be a lie.
-  const streamed = media.streamHeight || media.height;
+  // Report the rendition actually selected, not the file on disk.
+  const streamed = chosenQuality(media)?.height || media.streamHeight || media.height;
   if (streamed) bits.push(`${streamed}p${media.height > streamed ? ' (from ' + media.height + 'p)' : ''}`);
   if (media.hdr) bits.push('HDR tone-mapped');
   const softSubs = textSubs(media);
@@ -1683,11 +1800,19 @@ el.subsBtn.addEventListener('click', (event) => {
   toggleTrackMenu();
 });
 
-// Clicking anywhere else, or pressing Escape, closes the track menu.
+el.qualityBtn.addEventListener('click', (event) => {
+  event.stopPropagation();
+  toggleQualityMenu();
+});
+
+// Clicking anywhere else, or pressing Escape, closes either menu.
 document.addEventListener('click', (event) => {
-  if (el.trackMenu.classList.contains('hidden')) return;
-  if (el.trackMenu.contains(event.target) || el.subsBtn.contains(event.target)) return;
-  closeTrackMenu();
+  if (!el.trackMenu.classList.contains('hidden')) {
+    if (!el.trackMenu.contains(event.target) && !el.subsBtn.contains(event.target)) closeTrackMenu();
+  }
+  if (!el.qualityMenu.classList.contains('hidden')) {
+    if (!el.qualityMenu.contains(event.target) && !el.qualityBtn.contains(event.target)) closeQualityMenu();
+  }
 });
 
 el.fsBtn.addEventListener('click', () => {
@@ -1758,6 +1883,10 @@ document.addEventListener('drop', (event) => {
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && !el.trackMenu.classList.contains('hidden')) {
     closeTrackMenu();
+    return;
+  }
+  if (event.key === 'Escape' && !el.qualityMenu.classList.contains('hidden')) {
+    closeQualityMenu();
     return;
   }
   const typing = ['INPUT', 'TEXTAREA'].includes(event.target.tagName);
@@ -1856,6 +1985,7 @@ window.__sync = {
     readyState: el.video.readyState,
     nudging: state.nudging,
     rate: el.video.playbackRate,
+    quality: state.tracks?.quality ?? null,
     subtitles: !state.media
       ? 'none'
       : state.tracks.sub === 'styled'

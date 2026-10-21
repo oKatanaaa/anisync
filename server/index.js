@@ -125,8 +125,12 @@ app.post('/api/media/:id/prepare', async (req, res, next) => {
   try {
     const item = library.get(req.params.id);
     if (!item) return res.status(404).json({ error: 'unknown media' });
-    library.prepare(item.id).catch((err) => log('prepare failed:', err.message));
-    res.status(202).json({ ok: true, id: item.id });
+    // Build the main rendition by default; `{ height: 720, clean: true }` asks
+    // for a lighter copy or a subtitle-free one without touching what exists.
+    const height = Number(req.body?.height) || null;
+    const clean = Boolean(req.body?.clean) || req.body?.variant === 'clean';
+    library.prepare(item.id, { height, clean }).catch((err) => log('prepare failed:', err.message));
+    res.status(202).json({ ok: true, id: item.id, height, clean });
   } catch (err) {
     next(err);
   }
@@ -307,6 +311,39 @@ app.get('/media/:id/video.clean.mp4', (req, res) => {
     }
     return res.status(409).json({ error: 'not ready', repreparing: Boolean(item) });
   }
+  res.sendFile(file, {
+    headers: { 'Cache-Control': 'public, max-age=31536000, immutable' },
+    acceptRanges: true,
+    cacheControl: false,
+  });
+});
+
+/**
+ * A lighter rendition of the same episode (720p next to 1080p). Built on first
+ * request so a weak link has something to fall back to without re-uploading
+ * anything; the sharper rendition stays on disk.
+ */
+app.get('/media/:id/quality/:height/:kind', (req, res) => {
+  const { id, kind } = req.params;
+  const height = Number(req.params.height);
+  if (!isMediaId(id) || !Number.isFinite(height) || !['video.mp4', 'clean.mp4'].includes(kind)) {
+    return res.status(400).end();
+  }
+  const clean = kind === 'clean.mp4';
+  const file = path.join(config.cacheDir, id, clean ? `video.${height}.clean.mp4` : `video.${height}.mp4`);
+  if (!fs.existsSync(file)) {
+    const item = library.get(id);
+    if (item) {
+      if (item.altHeights?.[height]) {
+        item.altHeights[height] = item.altHeights[height].filter((k) => k !== (clean ? 'clean' : 'styled'));
+      }
+      broadcast({ t: 'library' });
+      library.prepare(id, { height, clean }).catch(() => {});
+    }
+    return res.status(409).json({ error: 'not ready', repreparing: Boolean(item) });
+  }
+  // Same immutable policy as the main rendition: the URL carries the source
+  // version, so a rebuilt file can never be served from a stale cache entry.
   res.sendFile(file, {
     headers: { 'Cache-Control': 'public, max-age=31536000, immutable' },
     acceptRanges: true,

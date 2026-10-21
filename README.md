@@ -213,6 +213,17 @@ track 0 stays muxed in the video (sample-accurate) and every other track is
 extracted to its own AAC file. Selecting one mutes the video element and plays the
 second element, kept in step by the same drift controller that syncs the room.
 
+**Quality.** The control bar carries a small pill showing the rendition in use
+(`1080p ▾`), and its menu offers a lighter one — 720p by default. Choosing it
+builds a second rendition on the server the first time (a couple of minutes,
+with the progress shown in the menu while the sharp one keeps playing), then
+switches the player without a reload. The sharper file is never replaced or
+deleted: switching back is instant, and the two copies live side by side in the
+episode's cache, never as separate library cards. Per viewer, like the other
+tracks. Measured on a 28-minute episode: **1080p 2.17 Mbps / 504 MB** versus
+**720p 1.17 Mbps / 291 MB** — about half the bandwidth for a phone on a relayed
+link. Extra rungs can be added with `ALT_HEIGHTS=720,480`.
+
 **External tracks.** Releases often ship the dub or subtitles as separate files.
 A file attaches to an episode when it shares the episode's full stem and has a
 usable extension:

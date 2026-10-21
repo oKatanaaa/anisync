@@ -1252,6 +1252,124 @@ await scenario('upload progress tells the truth', async () => {
   check('the survivors end up preparing and ready', ready, JSON.stringify(await a.evaluate(() => window.__uploadPhases)), a);
 });
 
+await scenario('switching to a lighter rendition', async () => {
+  const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const NAME = 'Ladder Episode - 01.mkv';
+  const file = path.join(root, 'media', NAME);
+  execSync(
+    `ffmpeg -y -v error -f lavfi -i testsrc2=size=1920x1080:rate=12 -f lavfi -i sine=frequency=440 -t 8 ` +
+      `-c:v libx264 -preset ultrafast -crf 26 -pix_fmt yuv420p -c:a aac "${file}"`,
+    { stdio: 'ignore' },
+  );
+  cleanups.push(async () => {
+    const list = await (await fetch(`${BASE}/api/library`)).json();
+    const item = list.media.find((m) => m.title.startsWith('Ladder Episode'));
+    fs.rmSync(file, { force: true });
+    if (item) fs.rmSync(path.join(root, 'cache', item.id), { recursive: true, force: true });
+    await fetch(`${BASE}/api/rescan`, { method: 'POST' });
+  });
+
+  const a = await join(await newPage(), 'Sol');
+  const b = await join(await newPage(), 'Tam');
+  await click(a, '.tab[data-tab=library]');
+  await click(a, '#rescanBtn');
+  await sleep(1200);
+
+  const id = await a.evaluate(async () => {
+    const data = await (await fetch('/api/library')).json();
+    return data.media.find((m) => m.title.startsWith('Ladder Episode'))?.id ?? null;
+  });
+  check('the episode is scanned', Boolean(id), String(id), a);
+  await a.evaluate(async (mediaId) => {
+    await fetch(`/api/media/${mediaId}/prepare`, { method: 'POST' });
+  }, id);
+  await waitFor(
+    a,
+    () => Boolean([...document.querySelectorAll('#library .card')].find((n) => n.textContent.includes('Ladder Episode'))?.querySelector('.btn.primary')),
+    60000,
+    'prepare',
+  );
+  // Pre-build the lighter copy so the click below is a switch, not a wait.
+  await a.evaluate(async (mediaId) => {
+    await fetch(`/api/media/${mediaId}/prepare`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ height: 720 }),
+    });
+  }, id);
+  await waitFor(
+    a,
+    (mediaId) =>
+      fetch('/api/library')
+        .then((response) => response.json())
+        .then((data) => Boolean(data.media.find((m) => m.id === mediaId)?.qualities?.[1]?.ready)),
+    120000,
+    '720 build',
+    id,
+  );
+
+  await openEpisode(a, 'Ladder Episode');
+  await click(a, '#playBtn');
+  await sleep(2000);
+
+  const pill = await a.evaluate(() => ({
+    hidden: document.getElementById('qualityBtn').classList.contains('hidden'),
+    label: document.getElementById('qualityLabel').textContent,
+  }));
+  check('the player offers a quality switch', !pill.hidden, JSON.stringify(pill), a);
+  check('it names the rendition in use', pill.label === '1080p', pill.label, a);
+
+  await click(a, '#qualityBtn');
+  const menu = await a.evaluate(() => ({
+    visible: !document.getElementById('qualityMenu').classList.contains('hidden'),
+    items: [...document.querySelectorAll('#qualityList .track-item')].map((n) => ({
+      name: n.querySelector('.track-name').textContent,
+      active: n.classList.contains('active'),
+    })),
+  }));
+  check('the menu lists both renditions of the same episode', menu.visible && menu.items.length === 2, JSON.stringify(menu.items), a);
+  check('the sharp one is active to begin with', menu.items[0]?.active && menu.items[0]?.name === '1080p', JSON.stringify(menu.items), a);
+
+  const before = await a.evaluate(() => ({
+    src: document.getElementById('video').currentSrc,
+    at: document.getElementById('video').currentTime,
+  }));
+  await a.evaluate(() => {
+    [...document.querySelectorAll('#qualityList .track-item')].find((n) => n.querySelector('.track-name').textContent === '720p').click();
+  });
+  const switched = await waitFor(a, () => document.getElementById('video').currentSrc.includes('/quality/720/'), 20000, '720p source');
+  const after = await a.evaluate(() => ({
+    src: document.getElementById('video').currentSrc,
+    at: document.getElementById('video').currentTime,
+    quality: window.__sync.snapshot().quality,
+    label: document.getElementById('qualityLabel').textContent,
+    meta: document.getElementById('nowSub').textContent,
+  }));
+  check('picking 720p switches the stream without a reload', switched, after.src.split('/').slice(-2).join('/'), a);
+  check('the position survives the switch', Math.abs(after.at - before.at) < 6, `${before.at.toFixed(1)}s → ${after.at.toFixed(1)}s`, a);
+  check('the control shows the chosen quality', after.quality === 720 && after.label === '720p', `${after.quality} / ${after.label}`, a);
+  check('the stage says what is being streamed', /720p/.test(after.meta), after.meta, a);
+  check('another viewer keeps the sharp stream', await b.evaluate(() => !document.getElementById('video').currentSrc.includes('/quality/720/')), '', b);
+
+  await click(a, '#qualityBtn');
+  await a.evaluate(() => {
+    [...document.querySelectorAll('#qualityList .track-item')].find((n) => n.querySelector('.track-name').textContent === '1080p').click();
+  });
+  check(
+    'switching back to 1080p is instant',
+    await waitFor(a, () => !document.getElementById('video').currentSrc.includes('/quality/720/'), 15000, 'back to 1080p'),
+    '',
+    a,
+  );
+
+  // One card, not two: the copy must never appear as a separate library entry.
+  const cards = await a.evaluate(() => [...document.querySelectorAll('#library .card')].filter((n) => n.textContent.includes('Ladder Episode')).length);
+  check('the lighter rendition is not a separate library item', cards === 1, `${cards} cards`, a);
+  const light = fs.statSync(path.join(root, 'cache', id, 'video.720.mp4'));
+  const sharp = fs.statSync(path.join(root, 'cache', id, 'video.mp4'));
+  check('the original rendition was kept, not replaced', sharp.size > light.size, `${(sharp.size / 1024 / 1024).toFixed(1)} MB vs ${(light.size / 1024 / 1024).toFixed(1)} MB`);
+});
+
 await scenario('deleting an episode', async () => {
   // Requests for the deleted file's poster and rendition 404 by definition.
   allowedErrors.push(/404/);

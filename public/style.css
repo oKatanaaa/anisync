@@ -745,3 +745,29 @@ video::cue {
   background: rgba(220, 60, 60, 0.28);
   color: #fff;
 }
+
+/* Quality switch: its own pill on the control bar, its own small menu. */
+.quality-menu {
+  right: 74px;
+  bottom: 56px;
+  width: 176px;
+}
+.quality-menu .track-title {
+  margin: 2px 0 6px;
+}
+.track-hint {
+  margin: 8px 2px 0;
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--muted);
+}
+.track-hint:empty {
+  display: none;
+}
+#qualityBtn {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+}
+@media (max-width: 880px) {
+  .quality-menu { right: 10px; bottom: 96px; }
+}
