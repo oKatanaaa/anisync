@@ -194,6 +194,39 @@ test('a 4K HDR release is streamed at the 1080p cap, tone-mapped to SDR', async 
   assert.equal(listed.height, 2160, 'while still knowing the source size');
 });
 
+test('deleting an episode takes its file, sidecars and cache with it', async () => {
+  makeEpisode('Delete Me - 01.mkv');
+  await fs.writeFile(
+    path.join(mediaDir, 'Delete Me - 01.en.srt'),
+    '1\n00:00:00,200 --> 00:00:01,500\nBye.\n',
+  );
+
+  const library = new Library({});
+  await library.scan();
+  const item = [...library.items.values()].find((i) => i.title.startsWith('Delete Me'));
+  assert.ok(item, 'episode scanned');
+  assert.equal(item.subs.filter((s) => s.origin === 'sidecar').length, 1, 'sidecar attached');
+  await library.prepare(item.id);
+  assert.ok(fss.existsSync(path.join(cacheDir, item.id, 'video.mp4')));
+
+  const removed = await library.remove(item.id);
+  assert.equal(removed.trashed, true);
+  assert.equal(fss.existsSync(path.join(mediaDir, 'Delete Me - 01.mkv')), false, 'source gone from the library');
+  assert.equal(fss.existsSync(path.join(mediaDir, 'Delete Me - 01.en.srt')), false, 'sidecar gone too');
+  assert.equal(fss.existsSync(path.join(cacheDir, item.id)), false, 'rendition and cache gone');
+  assert.equal(library.get(item.id), null, 'no longer listed');
+  assert.ok(fss.existsSync(removed.dest), 'kept in media/.trash so a misclick is recoverable');
+
+  // A rescan must not resurrect it from the trash directory.
+  const after = new Library({});
+  await after.scan();
+  assert.equal(
+    [...after.items.values()].some((i) => i.title.startsWith('Delete Me')),
+    false,
+    'the trash folder is not part of the library',
+  );
+});
+
 test('a probe cache makes the second scan cheap and still correct', async () => {
   makeEpisode('Episode 02.mkv');
   const first = new Library({});

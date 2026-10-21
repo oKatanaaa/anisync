@@ -229,6 +229,8 @@ async function closeAll() {
 async function scenario(name, fn) {
   if (filter && !name.toLowerCase().includes(filter.toLowerCase())) return;
   current = name;
+  // Allowances belong to the scenario that declared them, not to every later one.
+  allowedErrors.length = 0;
   console.log(`\n▶ ${name}`);
   ctx = await (browser.createBrowserContext ? browser.createBrowserContext() : browser.createIncognitoBrowserContext());
 
@@ -1209,6 +1211,83 @@ await scenario('upload progress tells the truth', async () => {
   check('the encode is reported as its own phase', prepared, (await readRow()).detail, a);
   const ready = await waitFor(a, () => document.getElementById('uploadPhase').textContent === 'Ready', 90000, 'ready');
   check('the row ends up saying the episode is ready', ready, (await readRow()).detail, a);
+});
+
+await scenario('deleting an episode', async () => {
+  // Requests for the deleted file's poster and rendition 404 by definition.
+  allowedErrors.push(/404/);
+  const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const NAME = 'Delete Me - 01.mkv';
+  const file = path.join(root, 'media', NAME);
+  execSync(
+    `ffmpeg -y -v error -f lavfi -i testsrc2=size=320x240:rate=24 -f lavfi -i sine=frequency=440 -t 3 ` +
+      `-c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac "${file}"`,
+    { stdio: 'ignore' },
+  );
+  cleanups.push(async () => {
+    const list = await (await fetch(`${BASE}/api/library`)).json();
+    const item = list.media.find((m) => m.title.startsWith('Delete Me'));
+    fs.rmSync(file, { force: true });
+    if (item) fs.rmSync(path.join(root, 'cache', item.id), { recursive: true, force: true });
+    await fetch(`${BASE}/api/rescan`, { method: 'POST' });
+  });
+
+  const a = await join(await newPage(), 'Rae');
+  await click(a, '.tab[data-tab=library]');
+  await click(a, '#rescanBtn');
+  await sleep(1200);
+
+  const id = await a.evaluate(async () => {
+    const data = await (await fetch('/api/library')).json();
+    return data.media.find((m) => m.title.startsWith('Delete Me'))?.id ?? null;
+  });
+  check('the episode is in the library', Boolean(id), String(id), a);
+  await a.evaluate(async (mediaId) => {
+    await fetch(`/api/media/${mediaId}/prepare`, { method: 'POST' });
+  }, id);
+  const ready = await waitFor(
+    a,
+    () => Boolean([...document.querySelectorAll('#library .card')].find((n) => n.textContent.includes('Delete Me'))?.querySelector('.card-delete:not([disabled])')),
+    60000,
+    'delete button',
+  );
+  check('the episode offers Play and a delete button', ready, '', a);
+
+  const cardText = () =>
+    a.evaluate(() => {
+      const card = [...document.querySelectorAll('#library .card')].find((n) => n.textContent.includes('Delete Me'));
+      return card ? card.textContent : null;
+    });
+  const clickIn = (selector) =>
+    a.evaluate((sel) => {
+      const card = [...document.querySelectorAll('#library .card')].find((n) => n.textContent.includes('Delete Me'));
+      card?.querySelector(sel)?.click();
+    }, selector);
+
+  // Cancel first: nothing may disappear without a confirmation.
+  await clickIn('.card-delete');
+  const asked = await waitFor(a, () => Boolean(document.querySelector('.confirm-text')), 5000, 'confirm question');
+  check('deleting asks first', asked, (await cardText()) || '', a);
+  await a.screenshot({ path: '/tmp/delete-confirm.png' });
+  await a.evaluate(() => {
+    const card = [...document.querySelectorAll('#library .card')].find((n) => n.textContent.includes('Delete Me'));
+    [...card.querySelectorAll('.btn')].find((b) => b.textContent === 'Cancel').click();
+  });
+  await sleep(600);
+  check('cancelling keeps the file', fs.existsSync(file) && (await cardText())?.includes('Delete Me'), '', a);
+
+  // Now confirm.
+  await clickIn('.card-delete');
+  await sleep(300);
+  await clickIn('.btn.danger');
+  check(
+    'the card disappears',
+    await waitFor(a, () => ![...document.querySelectorAll('#library .card')].some((n) => n.textContent.includes('Delete Me')), 15000, 'card gone'),
+    '',
+    a,
+  );
+  check('the file is gone from the server', !fs.existsSync(file), file);
+  check('the deletion is confirmed to the user', (await tip(a)).some((t) => /removed/i.test(t)), (await tip(a)).join(' | '), a);
 });
 
 // ---------------------------------------------------------------------------

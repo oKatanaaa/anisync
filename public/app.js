@@ -83,6 +83,7 @@ const state = {
   retries: 0,
   pingTimer: null,
   libRefreshAt: 0,
+  confirmDelete: null,
 };
 
 // ---------------------------------------------------------------------------
@@ -1234,6 +1235,21 @@ function renderLibrary() {
       row.appendChild(prep);
     }
 
+    const del = document.createElement('button');
+    del.className = 'btn ghost compact card-delete';
+    del.type = 'button';
+    del.textContent = '✕';
+    del.title = media.preparing
+      ? 'Preparing — you can delete this once the encode finishes'
+      : `Delete ${media.title} from the server`;
+    del.setAttribute('aria-label', `Delete ${media.title}`);
+    del.disabled = Boolean(media.preparing);
+    del.onclick = () => {
+      state.confirmDelete = media.id;
+      renderLibrary();
+    };
+    row.appendChild(del);
+
     if (media.preparing || (!media.prepared && media.progress > 0)) {
       const progress = document.createElement('div');
       progress.className = 'progress';
@@ -1243,6 +1259,11 @@ function renderLibrary() {
       row.appendChild(progress);
     }
 
+    // Deleting is a two-step action, and the question has to survive a library
+    // refresh (a rescan, another episode finishing) instead of being wiped by
+    // the next render.
+    if (state.confirmDelete === media.id) row.replaceChildren(...confirmDeleteRow(media));
+
     body.append(title, meta, row);
     if (thumb) card.append(thumb, body);
     else {
@@ -1251,6 +1272,51 @@ function renderLibrary() {
     }
     el.library.appendChild(card);
   }
+}
+
+/**
+ * Delete asks in place: the card's own buttons become a question, which is
+ * smaller and less jarring than a modal. The file goes to media/.trash, so a
+ * misclick on a 20 GB episode is recoverable.
+ */
+function confirmDeleteRow(media) {
+  const onScreen = state.media?.id === media.id;
+
+  const question = document.createElement('span');
+  question.className = 'confirm-text';
+  question.textContent = onScreen ? 'Delete? Stops the room.' : 'Delete this file?';
+
+  const yes = document.createElement('button');
+  yes.className = 'btn compact danger';
+  yes.type = 'button';
+  yes.textContent = 'Delete';
+  yes.onclick = async () => {
+    yes.disabled = true;
+    yes.textContent = 'Deleting…';
+    state.confirmDelete = null;
+    try {
+      const response = await fetch(`/api/media/${media.id}`, { method: 'DELETE' });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.error || `delete failed (${response.status})`);
+      }
+      toast(`${media.title} removed`);
+    } catch (err) {
+      toast(err.message || 'delete failed', 'error');
+    }
+    await refreshLibrary();
+  };
+
+  const no = document.createElement('button');
+  no.className = 'btn ghost compact';
+  no.type = 'button';
+  no.textContent = 'Cancel';
+  no.onclick = () => {
+    state.confirmDelete = null;
+    renderLibrary();
+  };
+
+  return [question, yes, no];
 }
 
 // ---------------------------------------------------------------------------

@@ -467,6 +467,42 @@ export class Library {
   }
 
   /**
+   * Take an episode out of the library: drop its cache and move the file into
+   * media/.trash (which the scan ignores). Unlinking outright would make one
+   * stray click on a 20 GB episode unrecoverable.
+   */
+  async remove(id) {
+    const item = this.items.get(id);
+    if (!item) return null;
+
+    const trashDir = path.join(config.mediaDir, '.trash');
+    await fs.mkdir(trashDir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const dest = path.join(trashDir, `${stamp}__${path.basename(item.path)}`);
+
+    // Sidecars belong to the episode; leaving them behind is exactly the junk
+    // this is meant to clear up.
+    const attachments = [...(item.subs || []), ...(item.audios || [])]
+      .filter((track) => track.origin === 'sidecar' && track.path)
+      .map((track) => track.path);
+
+    let trashed = false;
+    try {
+      await fs.rename(item.path, dest);
+      trashed = true;
+    } catch (err) {
+      // A file on another filesystem (or already gone) cannot be renamed.
+      if (err.code !== 'EXDEV' && err.code !== 'ENOENT') throw err;
+      await fs.rm(item.path, { force: true });
+    }
+    for (const file of attachments) await fs.rm(file, { force: true }).catch(() => {});
+    await fs.rm(this.cacheDirFor(id), { recursive: true, force: true });
+
+    this.items.delete(id);
+    return { trashed, dest, title: item.title };
+  }
+
+  /**
    * Make a source file playable in a browser. Idempotent, serialised, and
    * safe to call from several clients at once.
    */

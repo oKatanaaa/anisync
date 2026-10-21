@@ -132,6 +132,29 @@ app.post('/api/media/:id/prepare', async (req, res, next) => {
   }
 });
 
+app.delete('/api/media/:id', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    if (!isMediaId(id)) return res.status(400).json({ error: 'bad media id' });
+    const item = library.get(id);
+    if (!item) return res.status(404).json({ error: 'not in the library' });
+    // Deleting mid-encode would pull the cache directory out from under ffmpeg.
+    if (item.preparing) return res.status(409).json({ error: 'still preparing — try again when it finishes' });
+
+    const removed = await library.remove(id);
+    if (!removed) return res.status(404).json({ error: 'not in the library' });
+    // If that episode was on screen, the room forgets it instead of pointing
+    // every client at a file that no longer exists.
+    if (room.state.mediaId === id) room.forgetMedia();
+    pruneRoomMedia();
+    broadcast({ t: 'library' });
+    log(`removed ${removed.title}${removed.trashed ? ' (moved to media/.trash)' : ''}`);
+    return res.json({ ok: true, trashed: Boolean(removed.trashed) });
+  } catch (err) {
+    next(err);
+  }
+});
+
 app.post('/api/upload', (req, res) => {
   let bus;
   try {

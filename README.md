@@ -152,6 +152,14 @@ Files are queued and sent one at a time (a slow link split three ways is slower
 for everyone), and the ✕ cancels the upload in flight; the server deletes its
 `.part` file when the socket dies.
 
+**Deleting** is one click on the ✕ at the right of a card, then one confirmation.
+The file is moved to `media/.trash/` rather than unlinked (a misclick on a 20 GB
+episode should be recoverable), its cache and sidecar files go with it, and the
+episode disappears from every viewer's library immediately. If it was the episode
+on screen, the room forgets it instead of pointing everyone at a dead file.
+Deleting is refused while that episode is still encoding. Empty `media/.trash/`
+whenever you are sure.
+
 The upload path itself is not the bottleneck: measured from the server itself it
 takes **330 MB/s** for a 300 MB file. What you get on the wire is the network —
 over a Tailscale DERP relay expect **~1 MB/s**, over the LAN tens of MB/s. For
