@@ -1252,6 +1252,81 @@ await scenario('upload progress tells the truth', async () => {
   check('the survivors end up preparing and ready', ready, JSON.stringify(await a.evaluate(() => window.__uploadPhases)), a);
 });
 
+await scenario('a reload reports the files it cut short', async () => {
+  const a = await newPage();
+  await a.goto(BASE, { waitUntil: 'domcontentloaded' });
+  // Stand in for a batch that was in flight when the tab was reloaded.
+  await a.evaluate(() =>
+    localStorage.setItem('anisync:uploads-in-flight', JSON.stringify(['Episode 04.mkv', 'Episode 05.mkv'])),
+  );
+  await join(a, 'Vic');
+  const toasts = await tip(a);
+  check(
+    'the interrupted files are named',
+    toasts.some((t) => /interrupted/.test(t) && /Episode 04/.test(t) && /Episode 05/.test(t)),
+    toasts.join(' | '),
+    a,
+  );
+  check(
+    'the notice is cleared once it has been shown',
+    await a.evaluate(() => !localStorage.getItem('anisync:uploads-in-flight')),
+    '',
+    a,
+  );
+});
+
+await scenario('a batch uploads without waiting for the encoder', async () => {
+  const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const names = Array.from({ length: 6 }, (_, i) => `Batch ${i + 1} - 0${i + 1}.mkv`);
+  const files = names.map((name) => path.join(root, 'media', name));
+  for (const file of files) {
+    // 30-second 1080p clips: the encode takes a few seconds each, plenty of
+    // time for the next file's bytes to land if the queue is not blocked on it.
+    execSync(
+      `ffmpeg -y -v error -f lavfi -i testsrc2=size=1920x1080:rate=24 -f lavfi -i sine=frequency=440 -t 30 ` +
+        `-c:v libx264 -preset ultrafast -crf 32 -pix_fmt yuv420p -c:a aac "${file}"`,
+      { stdio: 'ignore' },
+    );
+  }
+  cleanups.push(async () => {
+    const list = await (await fetch(`${BASE}/api/library`)).json();
+    for (const file of files) fs.rmSync(file, { force: true });
+    for (const item of list.media) {
+      if (item.title.startsWith('Batch ')) fs.rmSync(path.join(root, 'cache', item.id), { recursive: true, force: true });
+    }
+    await fetch(`${BASE}/api/rescan`, { method: 'POST' });
+  });
+
+  const a = await join(await newPage(), 'Uma');
+  await click(a, '.tab[data-tab=library]');
+  await sleep(400);
+  await (await a.$('#uploadInput')).uploadFile(...files);
+
+  // Every file must reach the server while earlier ones are still encoding.
+  const allLanded = await waitFor(
+    a,
+    () => fetch('/api/library').then((r) => r.json()).then((d) => d.media.filter((m) => /^Batch /.test(m.title)).length >= 6),
+    90000,
+    'six files uploaded',
+  );
+  const state = await a.evaluate(() =>
+    fetch('/api/library')
+      .then((r) => r.json())
+      .then((d) => ({
+        uploaded: d.media.filter((m) => /^Batch /.test(m.title)).length,
+        prepared: d.media.filter((m) => /^Batch /.test(m.title) && m.prepared).length,
+      })),
+  );
+  check('all six files reach the server', allLanded && state.uploaded === 6, JSON.stringify(state), a);
+  check(
+    'they do not wait for the encoder to catch up',
+    state.prepared < state.uploaded,
+    `${state.prepared} of ${state.uploaded} encoded at that moment`,
+    a,
+  );
+  check('nothing is left in the upload queue', (await a.evaluate(() => document.querySelector('.upload-queue')?.textContent || '')) === '', '', a);
+});
+
 await scenario('switching to a lighter rendition', async () => {
   const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
   const NAME = 'Ladder Episode - 01.mkv';

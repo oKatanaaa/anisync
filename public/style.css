@@ -771,3 +771,23 @@ video::cue {
 @media (max-width: 880px) {
   .quality-menu { right: 10px; bottom: 96px; }
 }
+
+.upload-retry {
+  flex: none;
+  margin-left: auto;
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: transparent;
+  color: var(--text);
+  font-size: 10.5px;
+  cursor: pointer;
+}
+.upload-retry:hover {
+  border-color: var(--accent);
+  color: #fff;
+}
+/* When a retry button is showing, the dismiss ✕ sits right after it. */
+.upload-retry:not(.hidden) + .upload-cancel {
+  margin-left: 6px;
+}

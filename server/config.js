@@ -37,6 +37,12 @@ export const config = {
   /** Cap the stored rendition; 1080p is plenty for a laptop screen. */
   maxHeight: num(process.env.MAX_HEIGHT, 1080),
   /**
+   * Node kills any HTTP request whose body takes longer than 5 minutes by
+   * default, which silently aborted multi-gigabyte uploads. 0 disables it; set
+   * a number of milliseconds only if you want a ceiling.
+   */
+  uploadTimeoutMs: num(process.env.UPLOAD_REQUEST_TIMEOUT, 0),
+  /**
    * Extra renditions a viewer can switch to when the sharp one strains the
    * network. Built on demand, stored beside the main one, never replacing it.
    */

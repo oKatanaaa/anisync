@@ -180,6 +180,8 @@ app.post('/api/upload', (req, res) => {
     tempPath = null;
   };
 
+  const startedAt = Date.now();
+  let received = 0;
   bus.on('file', (_field, file, info) => {
     const safe = path.basename(info.filename).replace(/[^\w.\- ()[\]]+/g, '_').slice(0, 180);
     // Videos become library items; subtitle and audio sidecars are accepted so
@@ -196,6 +198,9 @@ app.post('/api/upload', (req, res) => {
     tempPath = temp;
     savedPath = dest;
     const out = fs.createWriteStream(temp);
+    file.on('data', (chunk) => {
+      received += chunk.length;
+    });
     file.pipe(out);
     out.on('error', (err) => {
       failure = failure || `write failed: ${err.message}`;
@@ -240,7 +245,11 @@ app.post('/api/upload', (req, res) => {
     // busboy finishes parsing before the last chunk is flushed to disk.
     if (writeDone) await writeDone.catch(() => {});
     if (failure) {
-      log(`upload rejected: ${failure}`);
+      const seconds = Math.max(0.1, (Date.now() - startedAt) / 1000);
+      log(
+        `upload rejected after ${seconds.toFixed(0)}s: ${failure} ` +
+          `(${(received / 1024 / 1024).toFixed(1)} MB, ${(received / 1024 / 1024 / seconds).toFixed(1)} MB/s)`,
+      );
       return res.status(400).json({ error: failure });
     }
     if (tooBig) {
@@ -253,6 +262,11 @@ app.post('/api/upload', (req, res) => {
     await library.scan();
     pruneRoomMedia();
     const item = [...library.items.values()].find((i) => i.path === savedPath);
+    const seconds = Math.max(0.1, (Date.now() - startedAt) / 1000);
+    log(
+      `upload received: ${path.basename(savedPath)} ` +
+        `(${(received / 1024 / 1024).toFixed(1)} MB in ${seconds.toFixed(0)}s, ${(received / 1024 / 1024 / seconds).toFixed(1)} MB/s)`,
+    );
     if (item) library.prepare(item.id).catch(() => {});
     broadcast({ t: 'library' });
     res.json({ ok: true, id: item?.id ?? null });
@@ -386,6 +400,11 @@ app.use((err, _req, res, _next) => {
 // ---------------------------------------------------------------------------
 
 const server = http.createServer(app);
+// Uploads are measured in gigabytes, so the default 5-minute request timeout
+// has to go: it aborts the connection mid-file and the client only sees a
+// vanished upload. Headers still get a normal timeout.
+server.requestTimeout = config.uploadTimeoutMs;
+server.headersTimeout = 60_000;
 const wss = new WebSocketServer({ noServer: true, maxPayload: 256 * 1024 });
 
 server.on('upgrade', (req, socket, head) => {
@@ -546,6 +565,11 @@ log(`library: ${library.items.size} file(s) in ${config.mediaDir}`);
 server.listen(config.port, config.bind, async () => {
   log(`anime-sync listening on http://${config.bind}:${config.port}`);
   log(`encoder: ${await detectEncoder(config.encoder)} · capacity: ${config.maxViewers}`);
+  log(
+    config.uploadTimeoutMs
+      ? `uploads: request timeout ${Math.round(config.uploadTimeoutMs / 1000)}s`
+      : 'uploads: no request timeout (gigabyte uploads are expected)',
+  );
 });
 
 const shutdown = (why = 'signal') => {

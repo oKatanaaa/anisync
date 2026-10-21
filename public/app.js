@@ -355,7 +355,7 @@ function handle(msg) {
       }
       // The episode we just uploaded is being converted: keep the upload row
       // honest instead of leaving it stuck at 100%.
-      for (const job of UPLOAD.active) {
+      for (const job of UPLOAD.following) {
         if (job.mediaId === msg.id && job.phase === 'preparing') {
           job.encode = msg.progress;
           job.startedEncoding = true;
@@ -1424,15 +1424,53 @@ function confirmDeleteRow(media) {
 // Uploads: one at a time, with an honest progress read-out
 // ---------------------------------------------------------------------------
 
+const PENDING_KEY = 'anisync:uploads-in-flight';
+
 const UPLOAD = {
   queue: [],
+  // `active` are the transfers using a slot; `following` are files whose bytes
+  // are already on the server and are now encoding. Keeping them apart matters:
+  // an encode takes minutes, and letting it hold a transfer slot meant the rest
+  // of a season did not even start uploading until the encoder caught up.
   active: [],
-  // Three at a time keeps a LAN link saturated without turning the per-file
+  following: [],
+  // Three transfers at a time saturates a LAN link without turning the per-file
   // speed and ETA into noise. The server still encodes one at a time.
   maxConcurrent: 3,
   renderTimer: null,
   seq: 0,
+  // Names of files whose bytes are not on the server yet, mirrored to
+  // localStorage: a reload throws the queue away, and silently losing three
+  // episodes out of a season is exactly what this is here to prevent.
+  pending: new Set(),
 };
+
+function rememberPending() {
+  try {
+    if (UPLOAD.pending.size) localStorage.setItem(PENDING_KEY, JSON.stringify([...UPLOAD.pending]));
+    else localStorage.removeItem(PENDING_KEY);
+  } catch {
+    /* storage is a nicety, not a requirement */
+  }
+}
+
+function forgetPending(name) {
+  UPLOAD.pending.delete(name);
+  rememberPending();
+}
+
+/** Say so on the next load if a reload cut a batch short. */
+function reportInterruptedUploads() {
+  let names = [];
+  try {
+    names = JSON.parse(localStorage.getItem(PENDING_KEY) || '[]');
+  } catch {
+    names = [];
+  }
+  if (!names.length) return;
+  toast(`${names.length} upload${names.length > 1 ? 's were' : ' was'} interrupted by a reload: ${names.join(', ')}`, 'error');
+  localStorage.removeItem(PENDING_KEY);
+}
 
 const fmtBytes = (n) => {
   if (!Number.isFinite(n)) return '—';
@@ -1491,6 +1529,12 @@ function uploadRow(job) {
   name.textContent = job.file.name;
   name.title = job.file.name;
 
+  const retry = document.createElement('button');
+  retry.className = 'upload-retry hidden';
+  retry.type = 'button';
+  retry.textContent = 'Retry';
+  retry.title = `Try ${job.file.name} again`;
+
   const cancel = document.createElement('button');
   cancel.className = 'upload-cancel';
   cancel.type = 'button';
@@ -1498,7 +1542,7 @@ function uploadRow(job) {
   cancel.title = `Cancel ${job.file.name}`;
   cancel.setAttribute('aria-label', `Cancel ${job.file.name}`);
 
-  top.append(phase, name, cancel);
+  top.append(phase, name, retry, cancel);
 
   const track = document.createElement('div');
   track.className = 'upload-track';
@@ -1522,8 +1566,11 @@ function rowFor(job) {
   return row;
 }
 
+const retryEl = (row) => row.querySelector('.upload-retry');
+
 function fillUploadRow(job, row, queued) {
   const phase = row.querySelector('.upload-phase');
+  retryEl(row)?.classList.add('hidden');
   const fill = row.querySelector('.upload-track > i');
   const detail = row.querySelector('.upload-detail');
   const cancel = row.querySelector('.upload-cancel');
@@ -1552,32 +1599,41 @@ function fillUploadRow(job, row, queued) {
     fill.style.width = '100%';
     detail.textContent = job.note || 'ready to play';
     cancel.classList.add('hidden');
+  } else if (job.phase === 'retrying') {
+    phase.textContent = 'Retrying';
+    fill.style.width = '0%';
+    detail.textContent = `${job.error || 'connection lost'} · attempt ${job.attempts + 1} of 3`;
+    cancel.classList.remove('hidden');
   } else if (job.phase === 'cancelled') {
     phase.textContent = 'Cancelled';
     fill.style.width = '0%';
     detail.textContent = 'upload cancelled';
     cancel.classList.add('hidden');
   } else if (job.phase === 'failed') {
+    // A skipped episode must not vanish after four seconds: keep the row until
+    // the viewer retries or dismisses it.
     phase.textContent = 'Failed';
     fill.style.width = '0%';
-    detail.textContent = job.error || 'upload failed';
-    cancel.classList.add('hidden');
+    detail.textContent = (job.error || 'upload failed') + (job.attempts ? ` · ${job.attempts + 1} tries` : '');
+    cancel.classList.remove('hidden');
+    retryEl(row)?.classList.remove('hidden');
   }
 }
 
 function renderUpload() {
-  if (!UPLOAD.active.length) {
+  const jobs = [...UPLOAD.active, ...UPLOAD.following].sort((a, b) => a.id - b.id);
+  if (!jobs.length) {
     el.uploadBar.replaceChildren();
     el.uploadBar.classList.add('hidden');
     return;
   }
   el.uploadBar.classList.remove('hidden');
 
-  for (const job of UPLOAD.active) fillUploadRow(job, rowFor(job));
+  for (const job of jobs) fillUploadRow(job, rowFor(job));
 
   // Drop rows for transfers that are gone.
   for (const row of [...el.uploadBar.querySelectorAll('.upload-row')]) {
-    if (!UPLOAD.active.some((job) => String(job.id) === row.dataset.job)) row.remove();
+    if (!jobs.some((job) => String(job.id) === row.dataset.job)) row.remove();
   }
 
   const queued = UPLOAD.queue.length;
@@ -1600,7 +1656,7 @@ function renderUpload() {
  * stuck at 97% forever while the server had finished minutes earlier.
  */
 function checkUploadJobs() {
-  for (const job of UPLOAD.active) {
+  for (const job of UPLOAD.following) {
     if (!job.mediaId || job.phase !== 'preparing' || job.finishing) continue;
     const uploaded = state.mediaList.find((m) => m.id === job.mediaId);
     if (uploaded?.prepared) {
@@ -1626,7 +1682,7 @@ let uploadWatchdog = null;
 function watchUploads() {
   if (uploadWatchdog) return;
   uploadWatchdog = setInterval(async () => {
-    const waiting = UPLOAD.active.some((job) => job.phase === 'preparing' && !job.finishing);
+    const waiting = UPLOAD.following.some((job) => job.phase === 'preparing' && !job.finishing);
     if (!waiting) {
       clearInterval(uploadWatchdog);
       uploadWatchdog = null;
@@ -1639,6 +1695,7 @@ function watchUploads() {
 
 function finishJob(job) {
   UPLOAD.active = UPLOAD.active.filter((entry) => entry !== job);
+  UPLOAD.following = UPLOAD.following.filter((entry) => entry !== job);
   job.xhr = null;
   renderUpload();
   refreshLibrary();
@@ -1673,7 +1730,6 @@ function runUpload(job) {
       job.phase = 'failed';
       job.error = message;
       renderUpload();
-      setTimeout(() => finishJob(job), 4000);
       return;
     }
     let added = null;
@@ -1683,12 +1739,17 @@ function runUpload(job) {
       /* ignore */
     }
     if (added?.id) {
+      forgetPending(job.file.name);
       // The server starts the encode as soon as the file lands; follow its
       // progress rather than pretending the upload finished the job.
       job.phase = 'preparing';
       job.mediaId = added.id;
       job.encode = 0;
       job.startedEncoding = false;
+      // The transfer is over: hand the slot to the next file in the queue and
+      // keep watching this one's encode in the background.
+      UPLOAD.active = UPLOAD.active.filter((entry) => entry !== job);
+      UPLOAD.following.push(job);
       renderUpload();
       watchUploads();
       pumpUploads();
@@ -1698,23 +1759,54 @@ function runUpload(job) {
     // does not start an encode.
     job.phase = 'done';
     job.note = 'added as a track';
+    forgetPending(job.file.name);
     renderUpload();
     toast(`${job.file.name} added as a track`);
     setTimeout(() => finishJob(job), 1600);
   };
-  xhr.onerror = () => {
-    job.phase = 'failed';
-    job.error = 'upload failed — connection lost';
-    renderUpload();
-    toast('upload failed', 'error');
-    setTimeout(() => finishJob(job), 4000);
-  };
-  xhr.onabort = () => {
+  xhr.onerror = () => scheduleRetry(job, 'connection lost');
+  xhr.onabort = () => scheduleRetry(job, 'upload interrupted');
+  xhr.send(form);
+}
+
+/**
+ * A dropped transfer is retried a couple of times before giving up: on a long
+ * season upload one hiccup used to mean a silently missing episode.
+ */
+function scheduleRetry(job, message) {
+  if (job.cancelled) {
     job.phase = 'cancelled';
     renderUpload();
     setTimeout(() => finishJob(job), 1200);
-  };
-  xhr.send(form);
+    return;
+  }
+  job.attempts = job.attempts || 0;
+  if (job.attempts < 2) {
+    job.attempts += 1;
+    job.phase = 'retrying';
+    job.error = message;
+    renderUpload();
+    setTimeout(() => restartJob(job), 1500 * job.attempts);
+    return;
+  }
+  job.phase = 'failed';
+  job.error = message;
+  renderUpload();
+  toast(`${job.file.name} failed: ${message}`, 'error');
+}
+
+function restartJob(job) {
+  if (job.cancelled || (!UPLOAD.active.includes(job) && !UPLOAD.following.includes(job))) return;
+  if (!UPLOAD.active.includes(job)) {
+    UPLOAD.following = UPLOAD.following.filter((entry) => entry !== job);
+    UPLOAD.active.push(job);
+  }
+  job.loaded = 0;
+  job.samples = [];
+  job.phase = 'uploading';
+  job.error = null;
+  renderUpload();
+  runUpload(job);
 }
 
 /** Start as many transfers as the concurrency limit allows. */
@@ -1741,17 +1833,38 @@ function pumpUploads() {
 function uploadFiles(files) {
   const list = [...(files || [])].filter(Boolean);
   if (!list.length) return;
+  for (const file of list) UPLOAD.pending.add(file.name);
+  rememberPending();
   UPLOAD.queue.push(...list);
   pumpUploads();
 }
 
+// A reload drops the queue and kills transfers in flight; ask first.
+window.addEventListener('beforeunload', (event) => {
+  if (!UPLOAD.queue.length && !UPLOAD.active.length) return;
+  event.preventDefault();
+  event.returnValue = '';
+});
+
 el.uploadBar.addEventListener('click', (event) => {
-  const button = event.target.closest('.upload-cancel');
-  if (!button) return;
-  const row = button.closest('.upload-row');
-  const job = UPLOAD.active.find((entry) => String(entry.id) === row?.dataset.job);
-  // Abort the request; the server drops its .part file on a dead socket.
-  job?.xhr?.abort();
+  const row = event.target.closest('.upload-row');
+  const job = [...UPLOAD.active, ...UPLOAD.following].find((entry) => String(entry.id) === row?.dataset.job);
+  if (!job) return;
+
+  if (event.target.closest('.upload-retry')) {
+    job.attempts = 0;
+    restartJob(job);
+    return;
+  }
+  if (event.target.closest('.upload-cancel')) {
+    // On a failed transfer the ✕ means "dismiss", not "abort".
+    if (job.phase === 'failed' || job.phase === 'cancelled') {
+      finishJob(job);
+      return;
+    }
+    job.cancelled = true;
+    job.xhr?.abort();
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -1782,6 +1895,9 @@ el.joinForm.addEventListener('submit', (event) => {
   localStorage.setItem('anisync:name', name);
   el.join.classList.add('hidden');
   connect(name);
+  // If a previous session was cut short by a reload, say which files never
+  // made it instead of letting them vanish.
+  reportInterruptedUploads();
 });
 
 el.playBtn.addEventListener('click', togglePlay);
