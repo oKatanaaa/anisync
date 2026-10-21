@@ -812,7 +812,9 @@ export class Library {
       item.bakedSubs = Boolean(bakeSub);
       item.hasClean = false;
       item.prepared = true;
-      item.progress = 100;
+      // Say 100% out loud: the encode's last progress tick lands around 97%,
+      // and a client that only hears progress would sit there looking stalled.
+      this.#progress(item, 100, 'ready');
       this.onEvent({ type: 'prepared', id: item.id });
       return this.list().find((m) => m.id === item.id);
     } catch (err) {

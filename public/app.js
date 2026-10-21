@@ -371,24 +371,7 @@ function handle(msg) {
       refreshLibrary().then(() => {
         // An upload finishes twice: bytes, then encoding. Only the library
         // knows about the second one.
-        for (const job of UPLOAD.active) {
-          if (!job.mediaId || job.phase !== 'preparing' || job.finishing) continue;
-          const uploaded = state.mediaList.find((m) => m.id === job.mediaId);
-          if (uploaded?.prepared) {
-            job.finishing = true;
-            job.phase = 'done';
-            job.encode = 100;
-            job.startedEncoding = true;
-            renderUpload();
-            setTimeout(() => finishJob(job), 1500);
-          } else if (uploaded?.error) {
-            job.finishing = true;
-            job.phase = 'failed';
-            job.error = uploaded.error;
-            renderUpload();
-            setTimeout(() => finishJob(job), 5000);
-          }
-        }
+        checkUploadJobs();
         // Keep the on-screen episode in step with the library: a new rendition
         // (subtitle-free copy, rebuilt cache) changes what we should be playing.
         const fresh = state.media ? state.mediaList.find((m) => m.id === state.media.id) : null;
@@ -1611,6 +1594,49 @@ function renderUpload() {
   }
 }
 
+/**
+ * Mark transfers whose episode is ready (or broken). Called on every library
+ * update *and* by a watchdog: a single missed broadcast used to leave a row
+ * stuck at 97% forever while the server had finished minutes earlier.
+ */
+function checkUploadJobs() {
+  for (const job of UPLOAD.active) {
+    if (!job.mediaId || job.phase !== 'preparing' || job.finishing) continue;
+    const uploaded = state.mediaList.find((m) => m.id === job.mediaId);
+    if (uploaded?.prepared) {
+      job.finishing = true;
+      job.phase = 'done';
+      job.encode = 100;
+      job.startedEncoding = true;
+      renderUpload();
+      setTimeout(() => finishJob(job), 1500);
+    } else if (uploaded?.error) {
+      job.finishing = true;
+      job.phase = 'failed';
+      job.error = uploaded.error;
+      renderUpload();
+      setTimeout(() => finishJob(job), 5000);
+    }
+  }
+}
+
+let uploadWatchdog = null;
+
+/** While anything is still encoding, re-check the library every few seconds. */
+function watchUploads() {
+  if (uploadWatchdog) return;
+  uploadWatchdog = setInterval(async () => {
+    const waiting = UPLOAD.active.some((job) => job.phase === 'preparing' && !job.finishing);
+    if (!waiting) {
+      clearInterval(uploadWatchdog);
+      uploadWatchdog = null;
+      return;
+    }
+    await refreshLibrary();
+    checkUploadJobs();
+  }, 8000);
+}
+
 function finishJob(job) {
   UPLOAD.active = UPLOAD.active.filter((entry) => entry !== job);
   job.xhr = null;
@@ -1664,6 +1690,7 @@ function runUpload(job) {
       job.encode = 0;
       job.startedEncoding = false;
       renderUpload();
+      watchUploads();
       pumpUploads();
       return;
     }
