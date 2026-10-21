@@ -31,6 +31,23 @@ const LAUNCH_ARGS = [
 ];
 
 /**
+ * These scenarios assert on room state (host, lock, seat counts), which is
+ * global: a real person with the player open makes them fail in confusing ways.
+ * Say so once instead of reporting eleven bogus failures.
+ */
+if (!filter) {
+  const health = await (await fetch(`${BASE}/api/health`)).json();
+  if (health.viewers > 0) {
+    console.error(
+      `\nThe room has ${health.viewers} viewer(s) connected.\n` +
+        `This suite asserts on room state and needs an empty room — close the player tab\n` +
+        `(or run a filtered scenario, e.g. npm run test:ui -- upload) and try again.\n`,
+    );
+    process.exit(2);
+  }
+}
+
+/**
  * The suite assumes the demo episode is ready to play. A wiped cache is a normal
  * state for this app, so make sure rather than failing 40 checks with a timeout.
  */
@@ -1128,8 +1145,73 @@ await scenario('no track controls when there is nothing to switch', async () => 
   check('the menu is not rendered either', !(await visible(a, '#trackMenu')), '', a);
 });
 
-// ---------------------------------------------------------------------------
+await scenario('upload progress tells the truth', async () => {
+  const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const NAME = 'Upload Progress Test - 01.mkv';
+  const file = path.join(root, 'media', NAME);
+  execSync(
+    `ffmpeg -y -v error -f lavfi -i testsrc2=size=1280x720:rate=24 -f lavfi -i sine=frequency=440 -t 12 ` +
+      `-c:v libx264 -preset ultrafast -crf 18 -pix_fmt yuv420p -c:a aac "${file}"`,
+    { stdio: 'ignore' },
+  );
+  cleanups.push(async () => {
+    const list = await (await fetch(`${BASE}/api/library`)).json();
+    const item = list.media.find((m) => m.title.includes('Upload Progress'));
+    fs.rmSync(file, { force: true });
+    if (item) fs.rmSync(path.join(root, 'cache', item.id), { recursive: true, force: true });
+    await fetch(`${BASE}/api/rescan`, { method: 'POST' });
+  });
 
+  const a = await join(await newPage(), 'Quinn');
+  await click(a, '.tab[data-tab=library]');
+  await sleep(400);
+
+  // Pretend the link is the relayed one that made uploads feel broken.
+  const cdp = await a.createCDPSession();
+  await cdp.send('Network.enable');
+  await cdp.send('Network.emulateNetworkConditions', {
+    offline: false,
+    latency: 60,
+    downloadThroughput: 4 * 1024 * 1024,
+    uploadThroughput: 1.4 * 1024 * 1024,
+  });
+
+  const readRow = () =>
+    a.evaluate(() => ({
+      hidden: document.getElementById('uploadBar').classList.contains('hidden'),
+      phase: document.getElementById('uploadPhase').textContent,
+      detail: document.getElementById('uploadDetail').textContent,
+      cancel: !document.getElementById('uploadCancel').classList.contains('hidden'),
+      width: document.getElementById('uploadFill').style.width,
+    }));
+
+  const input = await a.$('#uploadInput');
+  await input.uploadFile(file);
+
+  const live = await waitFor(a, () => /\d+ (KB|MB) of \d+ (MB|GB)/.test(document.getElementById('uploadDetail').textContent), 20000, 'byte counter');
+  const first = await readRow();
+  check('the upload row appears', !first.hidden && first.phase === 'Uploading', JSON.stringify(first), a);
+  check('it shows how much has been sent', live, first.detail, a);
+  check('a stuck upload can be cancelled', first.cancel, '', a);
+
+  // Speed and ETA need a couple of samples before they mean anything.
+  const measured = await waitFor(
+    a,
+    () => /\/s/.test(document.getElementById('uploadDetail').textContent) && /left/.test(document.getElementById('uploadDetail').textContent),
+    15000,
+    'speed and eta',
+  );
+  const row = await readRow();
+  check('it shows the transfer speed', measured && /\/s/.test(row.detail), row.detail, a);
+  check('it shows the time left', measured && /left/.test(row.detail), row.detail, a);
+
+  const prepared = await waitFor(a, () => document.getElementById('uploadPhase').textContent === 'Preparing', 60000, 'preparing');
+  check('the encode is reported as its own phase', prepared, (await readRow()).detail, a);
+  const ready = await waitFor(a, () => document.getElementById('uploadPhase').textContent === 'Ready', 90000, 'ready');
+  check('the row ends up saying the episode is ready', ready, (await readRow()).detail, a);
+});
+
+// ---------------------------------------------------------------------------
 await browser.close();
 
 const failed = results.filter((r) => !r.ok);

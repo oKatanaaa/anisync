@@ -128,10 +128,18 @@
         <button id="rescanBtn" class="btn ghost compact" type="button">Rescan folder</button>
         <label class="btn ghost compact upload-label">
           Upload
-          <input id="uploadInput" type="file" accept="video/*,.mkv,.ts,.m4a,.aac,.opus,.flac,.mp3,.ass,.ssa,.srt,.vtt" hidden />
+          <input id="uploadInput" type="file" multiple accept="video/*,.mkv,.ts,.m4a,.aac,.opus,.flac,.mp3,.ass,.ssa,.srt,.vtt" hidden />
         </label>
       </div>
-      <div id="uploadBar" class="upload-bar hidden"><div id="uploadFill"></div><span id="uploadLabel">uploading…</span></div>
+      <div id="uploadBar" class="upload hidden">
+        <div class="upload-top">
+          <span id="uploadPhase" class="upload-phase">Uploading</span>
+          <span id="uploadName" class="upload-name"></span>
+          <button id="uploadCancel" class="upload-cancel" type="button" title="Cancel this upload">✕</button>
+        </div>
+        <div class="upload-track"><i id="uploadFill"></i></div>
+        <div id="uploadDetail" class="upload-detail"></div>
+      </div>
       <div id="library" class="library"></div>
       <p class="hint" id="libraryHint">Upload a file here, or drop it into the server's <code>media/</code> folder and hit Rescan.</p>
     </div>

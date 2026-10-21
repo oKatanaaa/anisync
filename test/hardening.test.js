@@ -155,6 +155,45 @@ test('sidecar subtitle and audio files become switchable tracks', async () => {
   assert.equal(JSON.stringify(listed).includes(mediaDir), false, 'no absolute paths in the payload');
 });
 
+test('a 4K HDR release is streamed at the 1080p cap, tone-mapped to SDR', async () => {
+  const name = 'UHD Episode - 01.mkv';
+  const video = path.join(mediaDir, name);
+  // 2160p, PQ/BT.2020: the case where "just copy the streams" would both keep
+  // 4K (too heavy for a laptop or a phone) and leave the picture wiped out.
+  execSync(
+    `ffmpeg -y -v error -f lavfi -i testsrc2=size=3840x2160:rate=12 -f lavfi -i sine=frequency=440 -t 2 ` +
+      `-vf "zscale=pin=bt709:tin=bt709:min=bt709:p=bt2020:t=smpte2084:m=bt2020nc:r=limited,format=yuv420p10le" ` +
+      `-c:v libx264 -preset ultrafast -crf 30 -pix_fmt yuv420p10le ` +
+      `-color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc -c:a aac "${video}"`,
+    { stdio: 'ignore' },
+  );
+
+  const library = new Library({});
+  await library.scan();
+  const item = [...library.items.values()].find((i) => i.title.startsWith('UHD Episode'));
+  assert.ok(item, 'episode scanned');
+  assert.equal(item.hdr, true, 'HDR detected from the transfer function');
+  assert.equal(item.height, 2160);
+
+  await library.prepare(item.id);
+
+  const probe = JSON.parse(
+    execSync(
+      `ffprobe -v error -select_streams v:0 -show_entries stream=width,height,color_transfer,pix_fmt -of json ` +
+        `"${path.join(cacheDir, item.id, 'video.mp4')}"`,
+      { encoding: 'utf8' },
+    ),
+  ).streams[0];
+  assert.equal(probe.height, 1080, 'downscaled to the cap, never streamed at 2160p');
+  assert.equal(probe.width, 1920);
+  assert.equal(probe.color_transfer, 'bt709', 'tone-mapped to SDR');
+  assert.equal(probe.pix_fmt, 'yuv420p', '8-bit, so any browser can decode it');
+
+  const listed = library.list().find((m) => m.id === item.id);
+  assert.equal(listed.streamHeight, 1080, 'the UI is told what is actually streamed');
+  assert.equal(listed.height, 2160, 'while still knowing the source size');
+});
+
 test('a probe cache makes the second scan cheap and still correct', async () => {
   makeEpisode('Episode 02.mkv');
   const first = new Library({});

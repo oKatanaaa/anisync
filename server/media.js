@@ -8,7 +8,7 @@ import { assToVtt } from './assToVtt.js';
 import { findSidecars } from './sidecars.js';
 
 const VIDEO_EXT = new Set(['.mkv', '.mp4', '.webm', '.avi', '.mov', '.m4v', '.ts', '.m2ts', '.flv']);
-const PROBE_VERSION = 2;
+const PROBE_VERSION = 3;
 const BITMAP_SUBS = new Set(['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'xsub']);
 const FONT_EXT = new Set(['.ttf', '.otf', '.ttc', '.woff2']);
 
@@ -255,6 +255,13 @@ export class Library {
       muxed: i === 0,
     }));
 
+    // HDR cannot be handed to a browser untouched: without a tone map every
+    // frame comes out washed out and grey. Dolby Vision rides on top of the
+    // HDR10 base layer, so the same tone map covers it.
+    const dovi = (video?.side_data_list || []).find((sd) => /dovi/i.test(sd.side_data_type || ''));
+    const transfer = video?.color_transfer || '';
+    const hdr = ['smpte2084', 'arib-std-b67'].includes(transfer) || Boolean(dovi);
+
     const duration = Number(info.format?.duration) || Number(video?.duration) || 0;
     const data = {
       duration,
@@ -262,6 +269,9 @@ export class Library {
       height: video?.height || 0,
       videoCodec: video?.codec_name || null,
       pixFmt: video?.pix_fmt || null,
+      hdr,
+      doviProfile: dovi?.dv_profile ?? null,
+      colorTransfer: transfer || null,
       audioCodec: audio?.codec_name || null,
       hasAudio: Boolean(audio),
       audios,
@@ -400,6 +410,13 @@ export class Library {
           size: item.size,
           duration: item.duration,
           height: item.height,
+          // What the browser actually receives: a 4K source is streamed at the
+          // 1080p cap, never at 2160p.
+          streamHeight: Math.min(item.height || 0, config.maxHeight),
+          // Surfaced so the library can say "HDR, tone-mapped" instead of
+          // leaving people wondering why a 4K release looks different.
+          hdr: Boolean(item.hdr),
+          doviProfile: item.doviProfile ?? null,
           videoCodec: item.videoCodec,
           audioCodec: item.audioCodec,
           subs: item.subs
@@ -662,10 +679,15 @@ export class Library {
     // Remux when the streams are already browser-safe: MKV -> MP4 copy is
     // seconds instead of minutes and loses nothing. Burning subtitles rules
     // that out, since it means re-encoding the picture.
+    // Copying is only safe when the streams are browser-friendly *and* the
+    // frame size is something we are willing to stream: a 4K H.264 file would
+    // otherwise be remuxed untouched and choke a weak client.
     const copyable =
       !bakeSub &&
+      !item.hdr &&
       item.videoCodec === 'h264' &&
       item.pixFmt === 'yuv420p' &&
+      (!item.height || item.height <= config.maxHeight) &&
       (!muxedCodec || muxedCodec === 'aac' || muxedCodec === 'mp3');
 
     args.push('-map', '0:v:0');
@@ -673,8 +695,16 @@ export class Library {
       args.push('-c:v', 'copy');
     } else {
       const filters = [];
-      // Scale first so libass renders at the final resolution.
+      // Scale first so libass renders at the final resolution (and so the tone
+      // map runs on the smaller frame, which is much cheaper).
       if (item.height > config.maxHeight) filters.push(`scale=-2:${config.maxHeight}`);
+      // HDR10 / HLG / Dolby Vision -> BT.709 SDR. zscale does the linearisation
+      // and primaries conversion, tonemap does the curve; doing this at all is
+      // the difference between "washed out grey" and a normal-looking episode.
+      if (item.hdr) {
+        filters.push('zscale=t=linear:npl=100', 'format=gbrpf32le', 'zscale=p=bt709');
+        filters.push('tonemap=tonemap=hable:desat=0', 'zscale=t=bt709:m=bt709:r=tv');
+      }
       // Typesetting, signs and karaoke only survive if libass draws them.
       // Paths are relative to the cache dir (see .cwd) so no filter escaping.
       if (bakeSub) filters.push(`subtitles=filename=subs/${bakeSub.file}:fontsdir=fonts`);
@@ -683,6 +713,7 @@ export class Library {
       // source fps) is what makes clicking the scrub bar feel instant.
       args.push('-pix_fmt', 'yuv420p', '-sc_threshold', '0', '-force_key_frames', 'expr:gte(t,n_forced*2)');
       if (filters.length) args.push('-vf', filters.join(','));
+      if (item.hdr) args.push('-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709');
     }
 
     if (item.hasAudio && muxed) {

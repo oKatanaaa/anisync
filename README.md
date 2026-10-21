@@ -142,6 +142,43 @@ test/
   make-fixture.sh  builds a nasty test file (10-bit HEVC + ASS + font attachment)
 ```
 
+## Uploading
+
+Big files are the norm here, so the upload panel reports what is actually
+happening rather than a bare percentage: bytes sent of the total, current speed,
+time left, and — once the bytes have landed — the encode as a separate
+**Preparing** phase, because a 4K episode is not watchable the moment it arrives.
+Files are queued and sent one at a time (a slow link split three ways is slower
+for everyone), and the ✕ cancels the upload in flight; the server deletes its
+`.part` file when the socket dies.
+
+The upload path itself is not the bottleneck: measured from the server itself it
+takes **330 MB/s** for a 300 MB file. What you get on the wire is the network —
+over a Tailscale DERP relay expect **~1 MB/s**, over the LAN tens of MB/s. For
+multi-gigabyte episodes, copying the files into `media/` over the LAN and hitting
+**Rescan folder** is far faster than uploading.
+
+## 4K and HDR
+
+A 4K file is **never streamed at 4K**. Sources above `MAX_HEIGHT` (default
+**1080**) are re-encoded down to that height, so the browser receives 1920×1080
+at roughly 3–6 Mbps — decodable in hardware by any phone or laptop from the last
+decade. Streams are only remuxed untouched when they are already browser-friendly
+*and* within the cap; a 4K H.264 file is re-encoded rather than copied, precisely
+so it cannot slip through at 2160p. Set `MAX_HEIGHT=720` if the people watching
+are on a weak link (it roughly halves the bitrate).
+
+HDR is handled rather than ignored. HDR10, HLG and Dolby Vision releases are
+tone-mapped to BT.709 SDR with `zscale` + `tonemap`; without that step a PQ source
+displays with lifted blacks and washed-out colour. The stage line says
+"HDR tone-mapped" and shows the *streamed* height, e.g. `1080p (from 2160p)`, so
+nobody has to guess what the player is actually being fed.
+
+The cost is encode time: a 2160p HDR episode prepares at about **1× realtime**
+(≈20 minutes for a 24-minute episode), because software decoding of 4K plus the
+tone map plus x264 is all CPU. One encode runs at a time by design. Everything is
+cached, so the wait happens once per episode.
+
 ## Audio and subtitle tracks
 
 The player has one small control for both (the **CC** button, or `c`). It only
