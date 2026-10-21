@@ -32,6 +32,8 @@ const LAUNCH_ARGS = [
 
 const results = [];
 const cleanups = [];
+/** Expected failures, e.g. the 409 a scenario provokes on purpose. */
+const allowedErrors = [];
 let current = 'setup';
 let shotN = 0;
 let ctx = null;
@@ -205,7 +207,12 @@ async function scenario(name, fn) {
 
   for (const page of pages) {
     if (page.isClosed()) continue;
-    const errs = page.__errors.filter((e) => !/favicon|net::ERR_ABORTED|net::ERR_CONNECTION_REFUSED/.test(e));
+    const errs = page.__errors.filter(
+      (e) =>
+        !/favicon|net::ERR_ABORTED|net::ERR_CONNECTION_REFUSED/.test(e) &&
+        // Scenarios that deliberately break a URL declare the failure they expect.
+        !allowedErrors.some((pattern) => pattern.test(e)),
+    );
     if (errs.length) check('browser console stays clean', false, errs.slice(0, 3).join(' | '), page);
   }
 
@@ -701,6 +708,49 @@ await scenario('episode disappears from the library', async () => {
     '',
     a,
   );
+});
+
+await scenario('a wiped cache rebuilds itself', async () => {
+  // The 409 is exactly what this scenario is testing: the player must survive it.
+  allowedErrors.push(/409/, /Conflict/i);
+  const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const a = await join(await newPage(), 'Nadia');
+  await openEpisode(a);
+  await click(a, '#playBtn');
+  await sleep(2500);
+
+  const id = await a.evaluate(async () => {
+    const data = await (await fetch('/api/library')).json();
+    return data.media.find((m) => m.title.includes('Demo'))?.id;
+  });
+  // Simulate a cache wipe (disk cleanup, failed encode) while the room is live.
+  execSync(`rm -f ${JSON.stringify(path.join(root, 'cache', id, 'video.mp4'))}`, { stdio: 'ignore' });
+  await fetch(`${BASE}/api/rescan`, { method: 'POST' });
+  check('the server stops advertising the missing rendition', (await (await fetch(`${BASE}/api/library`)).json()).media.find((m) => m.id === id)?.prepared === false, '', a);
+
+  // Force the player to need bytes that are no longer there.
+  await a.evaluate(() => {
+    const v = document.getElementById('video');
+    v.currentTime = Math.max(5, v.currentTime + 30);
+  });
+  await sleep(2500);
+
+  check(
+    'playback recovers without a reload',
+    await waitFor(a, () => {
+      const v = document.getElementById('video');
+      return v.readyState >= 2 && !v.error;
+    }, 90000, 'rebuild'),
+    '',
+    a,
+  );
+  check(
+    'the rebuilt rendition is playable again',
+    await waitFor(a, () => window.__sync.snapshot().readyState >= 2 && window.__sync.snapshot().playing, 30000, 'resume'),
+    '',
+    a,
+  );
+  check('no error toast about a broken file', !(await a.evaluate(() => /Playback error/.test(document.body.textContent))), '', a);
 });
 
 await scenario('returning from another tab', async () => {

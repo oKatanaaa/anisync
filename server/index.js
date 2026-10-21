@@ -10,7 +10,7 @@ import { WebSocketServer } from 'ws';
 import { config } from './config.js';
 import { Library, isMediaId } from './media.js';
 import { Room } from './rooms.js';
-import { detectEncoder } from './ffmpeg.js';
+import { detectEncoder, killAll, runningChildren } from './ffmpeg.js';
 
 const log = (...args) => console.log(new Date().toISOString(), ...args);
 
@@ -27,6 +27,25 @@ function send(ws, msg) {
 function broadcast(msg) {
   const payload = JSON.stringify(msg);
   for (const ws of clients.keys()) if (ws.readyState === ws.OPEN) ws.send(payload);
+}
+
+/**
+ * Roster updates are the noisiest thing on the wire: every clock ping and every
+ * buffer event changes a latency or a badge. Three clients pinging every three
+ * seconds plus a seek storm should not become a broadcast storm, so send at most
+ * one roster per 200 ms and always flush the final state.
+ */
+let usersTimer = null;
+let usersPending = null;
+function broadcastUsers(users) {
+  usersPending = users;
+  if (usersTimer) return;
+  usersTimer = setTimeout(() => {
+    usersTimer = null;
+    const payload = usersPending;
+    usersPending = null;
+    if (payload) broadcast({ t: 'users', users: payload });
+  }, 200);
 }
 
 // ---------------------------------------------------------------------------
@@ -47,7 +66,7 @@ const room = new Room({
   seekDelayMs: config.seekDelayMs,
   onEvent: (type, payload) => {
     if (type === 'state') broadcast({ t: 'state', ...payload });
-    if (type === 'users') broadcast({ t: 'users', users: payload });
+    if (type === 'users') broadcastUsers(payload);
     if (type === 'chat') broadcast({ t: 'chat', entry: payload });
     if (type === 'lock') broadcast({ t: 'lock', locked: payload.locked });
   },
@@ -71,6 +90,10 @@ app.get('/api/health', async (_req, res) => {
     viewers: room.users.size,
     capacity: room.maxViewers,
     media: library.items.size,
+    prepared: library.list().filter((m) => m.prepared).length,
+    queue: library.inflight.size,
+    encoders: runningChildren(),
+    rss: Math.round(process.memoryUsage.rss() / 1024 ** 2),
     uptime: Math.round(process.uptime()),
   });
 });
@@ -119,6 +142,15 @@ app.post('/api/upload', (req, res) => {
   let savedPath = null;
   let tooBig = false;
   let failure = null;
+  let writeDone = null; // resolves when the temp file is flushed and renamed
+  let tempPath = null;
+  // A socket that dies mid-upload leaves a temp file behind; drop it at once
+  // rather than waiting for the next scan to sweep it.
+  const dropTemp = () => {
+    if (!tempPath) return;
+    fs.rm(tempPath, { force: true }, () => {});
+    tempPath = null;
+  };
 
   bus.on('file', (_field, file, info) => {
     const safe = path.basename(info.filename).replace(/[^\w.\- ()[\]]+/g, '_').slice(0, 180);
@@ -127,22 +159,61 @@ app.post('/api/upload', (req, res) => {
       file.resume();
       return;
     }
+    // Write beside the target and rename when the upload completes: a dropped
+    // connection must never leave a truncated file that looks like an episode.
     const dest = path.join(config.mediaDir, safe);
+    const temp = `${dest}.part`;
+    tempPath = temp;
     savedPath = dest;
-    const out = fs.createWriteStream(dest);
+    const out = fs.createWriteStream(temp);
     file.pipe(out);
+    out.on('error', (err) => {
+      failure = failure || `write failed: ${err.message}`;
+    });
     file.on('limit', () => {
       tooBig = true;
       out.destroy();
-      fs.rm(dest, { force: true }, () => {});
+      fs.rm(temp, { force: true }, () => {});
     });
-    file.on('error', () => out.destroy());
+    file.on('error', () => {
+      out.destroy();
+      fs.rm(temp, { force: true }, () => {});
+    });
+    writeDone = new Promise((resolve) => {
+      out.on('close', () => {
+        if (tooBig || failure) return resolve();
+        try {
+          fs.renameSync(temp, dest);
+        } catch (err) {
+          failure = `could not save upload: ${err.message}`;
+          fs.rm(temp, { force: true }, () => {});
+        }
+        resolve();
+      });
+    });
+  });
+
+  req.on('aborted', () => {
+    tooBig = false;
+    failure = failure || 'upload aborted';
+    dropTemp();
+  });
+  // Node 22 reports a dead upload as 'close' with an incomplete request rather
+  // than 'aborted'; both paths have to be covered.
+  req.on('close', () => {
+    if (req.complete) return;
+    failure = failure || 'upload aborted';
+    dropTemp();
   });
 
   bus.on('close', async () => {
+    // busboy finishes parsing before the last chunk is flushed to disk.
+    if (writeDone) await writeDone.catch(() => {});
     if (failure) return res.status(400).json({ error: failure });
     if (tooBig) return res.status(413).json({ error: 'file too large' });
-    if (!savedPath) return res.status(400).json({ error: 'no file received' });
+    if (!savedPath || !fs.existsSync(savedPath)) {
+      return res.status(400).json({ error: 'no file received' });
+    }
     await library.scan();
     pruneRoomMedia();
     const item = [...library.items.values()].find((i) => i.path === savedPath);
@@ -160,12 +231,31 @@ app.post('/api/upload', (req, res) => {
 
 const sendIfExists = (res, file, headers = {}) => {
   if (!fs.existsSync(file)) return res.status(404).json({ error: 'not ready' });
+  // acceptRanges + conditional GET are what make scrubbing feel instant: the
+  // browser keeps what it already has and asks only for the missing bytes.
   res.sendFile(file, { headers, acceptRanges: true, cacheControl: false });
 };
 
 app.get('/media/:id/video.mp4', (req, res) => {
-  if (!isMediaId(req.params.id)) return res.status(400).end();
-  sendIfExists(res, path.join(config.cacheDir, req.params.id, 'video.mp4'), { 'Cache-Control': 'public, max-age=0' });
+  const { id } = req.params;
+  if (!isMediaId(id)) return res.status(400).end();
+  const file = path.join(config.cacheDir, id, 'video.mp4');
+  if (!fs.existsSync(file)) {
+    // The cache was wiped or the encode never finished. Say so honestly and
+    // start again instead of handing the player a 404 it reports as a codec
+    // error. The URL carries the source version, so caching stays safe.
+    const item = library.get(id);
+    if (item) {
+      item.prepared = false;
+      library.prepare(id).catch(() => {});
+    }
+    return res.status(409).json({ error: 'not ready', repreparing: Boolean(item) });
+  }
+  res.sendFile(file, {
+    headers: { 'Cache-Control': 'public, max-age=31536000, immutable' },
+    acceptRanges: true,
+    cacheControl: false,
+  });
 });
 
 app.get('/media/:id/poster.jpg', (req, res) => {
@@ -237,7 +327,19 @@ wss.on('connection', (ws, url) => {
 
   // One malformed or unexpected message must never take the room down with it:
   // a crash here disconnects everyone mid-episode.
+  let budget = 60; // messages per second, per connection
+  const refill = setInterval(() => {
+    budget = 60;
+  }, 1000);
+  refill.unref();
+  ws.on('close', () => clearInterval(refill));
+
   ws.on('message', (raw) => {
+    if (--budget < 0) {
+      // A runaway client (or a script) must not be able to melt the room.
+      send(ws, { t: 'error', message: 'Slow down — too many messages' });
+      return;
+    }
     try {
       handleMessage(ws, user, raw);
     } catch (err) {
@@ -322,13 +424,34 @@ server.listen(config.port, config.bind, async () => {
   log(`encoder: ${await detectEncoder(config.encoder)} · capacity: ${config.maxViewers}`);
 });
 
-const shutdown = () => {
-  log('shutting down');
+const shutdown = (why = 'signal') => {
+  log(`shutting down (${why})`);
   clearInterval(heartbeat);
   clearInterval(sweeper);
+  if (usersTimer) clearTimeout(usersTimer);
+  killAll();
   for (const ws of clients.keys()) ws.close(1001, 'server shutting down');
   server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 2000);
+  setTimeout(() => process.exit(0), 2000).unref();
 };
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+// A bug in one request must not silently kill the whole party: log it, tell
+// systemd it was a crash, and let Restart=always bring us back in a second.
+process.on('uncaughtException', (err) => {
+  log('FATAL uncaught:', err.stack || err.message);
+  shutdown('uncaughtException');
+  setTimeout(() => process.exit(1), 1500).unref();
+});
+process.on('unhandledRejection', (reason) => {
+  log('FATAL unhandled rejection:', reason?.stack || String(reason));
+  shutdown('unhandledRejection');
+  setTimeout(() => process.exit(1), 1500).unref();
+});
+
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') log(`port ${config.port} is already in use — another instance running?`);
+  else log('server error:', err.message);
+  process.exit(1);
+});

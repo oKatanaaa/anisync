@@ -87,8 +87,8 @@ All optional, via environment variables:
 ## Testing
 
 ```bash
-npm test          # 40 unit tests: sync math + room state machine
-npm run test:ui   # 97 checks driving the real UI in real Chrome
+npm test          # 48 unit tests: sync math, room state machine, hardening
+npm run test:ui   # 106 checks driving the real UI in real Chrome
 ```
 
 `npm run test:ui` needs the server running. Scenarios whose name matches an
@@ -132,11 +132,86 @@ public/
   app.js      player, drift loop, chat, library UI
   style.css   dark glass UI
 test/
-  sync.test.js     sync math: clock offset, drift decisions, 60 s simulation
-  rooms.test.js    room state machine: host, lock, capacity, end of episode, idle reset
-  ui.mjs           user-facing suite (real Chrome, real clicks, screenshots on failure)
+  sync.test.js      sync math: clock offset, drift decisions, 60 s simulation
+  rooms.test.js     room state machine: host, lock, capacity, end of episode, idle reset
+  hardening.test.js stall watchdog, child cleanup, cache GC, cache validation
+  ui.mjs            user-facing suite (real Chrome, real clicks, screenshots on failure)
   make-fixture.sh  builds a nasty test file (10-bit HEVC + ASS + font attachment)
 ```
+
+## Performance
+
+Measured on this machine (16 threads, software x264, loopback), with the demo
+episode at 720p:
+
+| what | number |
+|---|---|
+| encode throughput | 14.7× realtime (90 s episode in ~6 s) |
+| full prepare incl. poster + subtitle burn-in | 10.3× realtime (~9 s for 90 s) |
+| seek latency, time to first byte | median 2.5 ms, p95 3.1 ms |
+| library scan, 200 episodes, cold | 1.8 s (was ~11 s serial) |
+| library scan, 200 episodes, unchanged | 17–40 ms |
+| boot to listening (1 episode) | 0.2 s |
+| client↔client drift, three browsers | median 2–14 ms, p95 29–51 ms |
+| server RSS | ~75 MB idle |
+
+What made the difference:
+
+- **Two-second keyframes** (`-force_key_frames expr:gte(t,n_forced*2)`, fps
+  independent) instead of 96-frame GOPs: seeking lands on a nearby keyframe
+  instead of up to four seconds back. Costs about 1.5% file size.
+- **`immutable` caching with versioned URLs.** `/media/<id>/video.mp4?v=<source
+  version>` lets the browser keep the whole rendition and serve seeks from disk
+  with no revalidation round trip. A changed source produces a different URL, so
+  stale bytes are impossible.
+- **Bounded-parallel probing.** One `ffprobe` per file is the slow part of a
+  scan; eight at a time turns a 200-episode library from ~11 s into ~1.8 s.
+  Probe results are cached in `cache/<id>/probe.json` keyed by size+mtime, so
+  rescans of an unchanged library are tens of milliseconds.
+- **Coalesced roster broadcasts.** Latency and buffering updates are the noisiest
+  thing on the wire (every clock ping changes one); they are batched into at most
+  one roster message per 200 ms.
+- **One encode at a time**, deliberately. Two x264 jobs on a laptop is how you
+  make the party stutter.
+
+## When things go wrong
+
+The failure modes that matter for a three-hour session are blackouts, not
+crashes: a laptop sleeping, Wi-Fi dropping, an encode wedging, a disk filling.
+
+- **A hung encode is killed.** `run()` has a stall watchdog (no output for 120 s)
+  and a 6-hour ceiling, so a wedged ffmpeg cannot occupy the single-slot queue
+  forever. Children are tracked and killed on shutdown, so a restart never leaves
+  an orphan encoder eating CPU.
+- **Disk space is checked before a long encode** (needs ~2× the source, minimum
+  1.5 GB) so it fails in a second with a clear message instead of dying halfway.
+- **Interrupted work is cleaned up on the next scan:** cache directories for
+  files that no longer exist, `video.partial.mp4` from a killed encode, and
+  `.part` files from aborted uploads.
+- **Uploads are atomic.** The bytes land in `<name>.part` and are renamed on
+  completion; a dropped connection never leaves a truncated file that looks like
+  an episode.
+- **A disappeared file is not served as a lie.** If a rendition is missing the
+  server answers 409 (not 404), marks it unprepared and re-encodes; the client
+  notices, retries with a cache-busting URL and resumes on its own — no reload.
+- **The room never plays to an empty house.** Last viewer out freezes the
+  timeline; a long-empty room is rewound for the next person.
+- **Reconnects are forever.** The client backs off with jitter (max 15 s) and
+  resets on a successful open; it never gives up on a long session.
+- **A bad request cannot kill the party.** Every socket message is wrapped, each
+  connection has a 60 msg/s budget, and `uncaughtException` /
+  `unhandledRejection` log, kill encoders and exit non-zero so systemd restarts a
+  working process in ~2 s.
+- **The unit bounds the blast radius:** `Restart=always`, `RestartSec=2`, restart
+  burst limit, `MemoryHigh=2G`/`MemoryMax=4G` so a leak throttles and dies inside
+  its own cgroup instead of the kernel OOM killer picking another victim on the
+  host, `KillMode=mixed` so ffmpeg children go too.
+
+One thing deliberately *not* done: no `WatchdogSec`/`sd_notify`. systemd's notify
+socket is a `SOCK_DGRAM` unix socket and Node's `net` can only open `SOCK_STREAM`
+to a path, so `READY=1` never arrives and `Type=notify` fails the start. Doing it
+properly needs a native dependency or spawning `systemd-notify` on a timer; the
+failure modes above are covered without it.
 
 ## Deliberate limits
 

@@ -11,6 +11,32 @@ const FONT_EXT = new Set(['.ttf', '.otf', '.ttc', '.woff2']);
 
 export const isMediaId = (id) => typeof id === 'string' && /^[0-9a-f]{12}$/.test(id);
 
+/** Run `fn` over `items` with at most `limit` in flight, preserving order. */
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next++;
+      out[index] = await fn(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+/** Free bytes on the filesystem holding `dir`, or Infinity when unknown. */
+export async function freeBytes(dir) {
+  try {
+    const st = await fs.statfs(dir);
+    return st.bavail * st.bsize;
+  } catch {
+    return Infinity;
+  }
+}
+
+const fmtBytes = (n) => (n >= 1024 ** 3 ? `${(n / 1024 ** 3).toFixed(1)} GB` : `${Math.round(n / 1024 ** 2)} MB`);
+
 const idFor = (rel) => crypto.createHash('sha1').update(rel).digest('hex').slice(0, 12);
 
 const tidyTitle = (name) =>
@@ -33,6 +59,7 @@ export class Library {
     /** @type {Map<string, object>} */
     this.items = new Map();
     this.inflight = new Map();
+    this.preparingIds = new Set();
     this.scanning = null;
     // Serialise heavy work: two concurrent x264 jobs on a laptop is how you
     // make the party stutter.
@@ -71,17 +98,30 @@ export class Library {
       await walk(this.mediaDir, 0);
 
       const next = new Map();
-      for (const full of found) {
+      const pending = [];
+      const stats = await mapLimit(found, 8, async (full) => {
+        try {
+          return { full, stat: await fs.stat(full) };
+        } catch {
+          return null;
+        }
+      });
+
+      for (const entry of stats) {
+        if (!entry) continue;
+        const { full, stat } = entry;
         const rel = path.relative(this.mediaDir, full);
         const id = idFor(rel);
-        let stat;
-        try {
-          stat = await fs.stat(full);
-        } catch {
-          continue;
-        }
         const previous = this.items.get(id);
         if (previous && previous.size === stat.size && previous.mtimeMs === stat.mtimeMs) {
+          // Unchanged file — but the cache behind it may not be. Without this
+          // check a wiped or half-written cache keeps claiming to be prepared
+          // and every viewer gets a 404 on a URL the UI said was ready.
+          if (previous.prepared && !(await this.#preparedMeta(previous))) {
+            previous.prepared = false;
+            previous.bakedSubs = false;
+            previous.progress = 0;
+          }
           next.set(id, previous);
           continue;
         }
@@ -105,6 +145,13 @@ export class Library {
           progress: 0,
           error: null,
         };
+        next.set(id, item);
+        pending.push(item);
+      }
+
+      // Probing is one ffprobe per new file; a few in parallel turns a
+      // 200-episode library from ~11 s of serial work into ~2 s.
+      await mapLimit(pending, 8, async (item) => {
         try {
           Object.assign(item, await this.#probe(item));
         } catch (err) {
@@ -113,9 +160,10 @@ export class Library {
         const meta = await this.#preparedMeta(item);
         item.prepared = Boolean(meta);
         item.bakedSubs = Boolean(meta?.bakedSubs);
-        next.set(id, item);
-      }
+      });
+
       this.items = next;
+      await this.#collectGarbage(next);
       return this.list();
     })().finally(() => {
       this.scanning = null;
@@ -164,6 +212,49 @@ export class Library {
     return data;
   }
 
+  /**
+   * Delete what a crash or an aborted upload leaves behind: cache directories
+   * for files that no longer exist, half-written renditions, and upload temp
+   * files. Runs after every scan, so a restart cleans up by itself.
+   */
+  async #collectGarbage(items) {
+    let cacheEntries = [];
+    try {
+      cacheEntries = await fs.readdir(this.cacheDir, { withFileTypes: true });
+    } catch {
+      cacheEntries = [];
+    }
+    for (const entry of cacheEntries) {
+      if (!entry.isDirectory()) continue;
+      if (items.has(entry.name) || this.preparingIds.has(entry.name)) continue;
+      await fs.rm(path.join(this.cacheDir, entry.name), { recursive: true, force: true }).catch(() => {});
+    }
+
+    for (const id of items.keys()) {
+      const dir = path.join(this.cacheDir, id);
+      let files;
+      try {
+        files = await fs.readdir(dir);
+      } catch {
+        continue;
+      }
+      for (const file of files) {
+        if (file.endsWith('.partial.mp4') && !this.preparingIds.has(id)) {
+          await fs.rm(path.join(dir, file), { force: true }).catch(() => {});
+        }
+      }
+    }
+
+    try {
+      const libFiles = await fs.readdir(this.mediaDir);
+      for (const file of libFiles) {
+        if (file.endsWith('.part')) await fs.rm(path.join(this.mediaDir, file), { force: true }).catch(() => {});
+      }
+    } catch {
+      /* media dir may not exist yet */
+    }
+  }
+
   /** Returns the transcode metadata when a valid rendition exists, else null. */
   async #preparedMeta(item) {
     const dir = this.cacheDirFor(item.id);
@@ -183,31 +274,37 @@ export class Library {
 
   list() {
     return [...this.items.values()]
-      .map((item) => ({
-        id: item.id,
-        title: item.title,
-        rel: item.rel,
-        size: item.size,
-        duration: item.duration,
-        height: item.height,
-        videoCodec: item.videoCodec,
-        audioCodec: item.audioCodec,
-        subs: item.subs
-          .filter((s) => !s.bitmap && s.file)
-          .map((s) => ({ index: s.index, label: s.label, lang: s.lang, default: s.default, file: s.file, vtt: s.vtt })),
-        hasBitmapSubs: item.subs.some((s) => s.bitmap),
-        bakedSubs: Boolean(item.bakedSubs),
-        fonts: item.fonts,
-        prepared: item.prepared,
-        preparing: item.preparing,
-        progress: item.progress,
-        // Only advertise a poster once the prepare step has actually written
-        // one, otherwise every unprepared card fetches a 404 and flashes a
-        // broken image.
-        poster: item.prepared ? `/media/${item.id}/poster.jpg` : null,
-        playbackUrl: `/media/${item.id}/video.mp4`,
-        error: item.error,
-      }))
+      .map((item) => {
+        const version = `${item.size.toString(36)}${Math.round(item.mtimeMs).toString(36)}`;
+        return {
+          id: item.id,
+          title: item.title,
+          rel: item.rel,
+          size: item.size,
+          duration: item.duration,
+          height: item.height,
+          videoCodec: item.videoCodec,
+          audioCodec: item.audioCodec,
+          subs: item.subs
+            .filter((s) => !s.bitmap && s.file)
+            .map((s) => ({ index: s.index, label: s.label, lang: s.lang, default: s.default, file: s.file, vtt: s.vtt })),
+          hasBitmapSubs: item.subs.some((s) => s.bitmap),
+          bakedSubs: Boolean(item.bakedSubs),
+          fonts: item.fonts,
+          prepared: item.prepared,
+          preparing: item.preparing,
+          progress: item.progress,
+          // Only advertise a poster once the prepare step has actually written
+          // one, otherwise every unprepared card fetches a 404 and flashes a
+          // broken image.
+          poster: item.prepared ? `/media/${item.id}/poster.jpg?v=${version}` : null,
+          // The version string is what makes `immutable` caching safe: a changed
+          // source produces a different URL, so a browser never keeps a stale
+          // rendition. Seeks then come out of the local cache with no round trip.
+          playbackUrl: `/media/${item.id}/video.mp4?v=${version}`,
+          error: item.error,
+        };
+      })
       .sort((a, b) => a.title.localeCompare(b.title, undefined, { numeric: true, sensitivity: 'base' }));
   }
 
@@ -248,6 +345,7 @@ export class Library {
     item.preparing = true;
     item.error = null;
     item.progress = 0;
+    this.preparingIds.add(item.id);
     this.#progress(item, 1, 'probing');
 
     try {
@@ -260,12 +358,25 @@ export class Library {
 
       const out = path.join(dir, 'video.mp4');
       const tmp = path.join(dir, 'video.partial.mp4');
+
+      // Running out of space halfway through a two-hour encode costs the whole
+      // encode, so refuse to start when the room is obviously not there.
+      const need = Math.max(item.size * 2, 1.5 * 1024 ** 3);
+      const free = await freeBytes(this.cacheDir);
+      if (free < need) {
+        throw new Error(`not enough disk space: ${fmtBytes(free)} free, about ${fmtBytes(need)} needed`);
+      }
+
       const encoder = await detectEncoder(config.encoder);
       const bakeSub = config.subtitles === 'bake' ? (subs.find((s) => !s.bitmap) ?? null) : null;
       const args = await this.#transcodeArgs(item, tmp, encoder, { bakeSub });
 
       const { code, stderr } = await run('ffmpeg', args, {
         cwd: dir, // keeps the subtitles filter path short and quoting-free
+        // A wedged encode (bad file, NFS hiccup, OOM pressure) would otherwise
+        // occupy the single-slot queue forever.
+        stallMs: 120_000,
+        maxRuntimeMs: 6 * 3600_000,
         onStdout: (chunk) => {
           const p = parseProgress(chunk);
           if (p.seconds && item.duration) this.#progress(item, 4 + 95 * Math.min(1, p.seconds / item.duration), 'encoding');
@@ -306,6 +417,7 @@ export class Library {
       throw err;
     } finally {
       item.preparing = false;
+      this.preparingIds.delete(item.id);
       await fs.rm(path.join(dir, 'video.partial.mp4'), { force: true }).catch(() => {});
     }
   }
@@ -333,7 +445,9 @@ export class Library {
       // Paths are relative to the cache dir (see .cwd) so no filter escaping.
       if (bakeSub) filters.push(`subtitles=filename=subs/${bakeSub.file}:fontsdir=fonts`);
       args.push(...encoderArgs(encoder, { crf: config.crf }));
-      args.push('-pix_fmt', 'yuv420p', '-g', '96', '-keyint_min', '96', '-sc_threshold', '0');
+      // A keyframe every two seconds (time-based, so it does not depend on the
+      // source fps) is what makes clicking the scrub bar feel instant.
+      args.push('-pix_fmt', 'yuv420p', '-sc_threshold', '0', '-force_key_frames', 'expr:gte(t,n_forced*2)');
       if (filters.length) args.push('-vf', filters.join(','));
     }
 

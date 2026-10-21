@@ -124,6 +124,7 @@ function connect(name) {
   state.ws = ws;
 
   ws.onopen = () => {
+    // A successful open clears the backoff so a long session cannot exhaust it.
     state.retries = 0;
     setBadge('syncing clock…');
     startPings();
@@ -145,14 +146,14 @@ function connect(name) {
       showJoin('The room is full — three seats only.');
       return;
     }
-    if (state.retries > 8) {
-      setBadge('disconnected', 'bad');
-      toast('Connection lost. Reload to reconnect.', 'error');
-      return;
-    }
+    // Keep trying forever: a watch party lasts hours and Wi-Fi blips. The delay
+    // is capped, and jittered so three clients do not stampede a restarting
+    // server in lockstep.
     state.retries += 1;
-    setBadge('reconnecting…', 'ok');
-    setTimeout(() => connect(name), Math.min(8000, 600 * 2 ** state.retries));
+    const base = Math.min(15_000, 600 * 2 ** Math.min(state.retries, 5));
+    const delay = base * (0.75 + Math.random() * 0.5);
+    setBadge(state.retries > 2 ? 'disconnected · retrying' : 'reconnecting…', state.retries > 2 ? 'bad' : 'ok');
+    setTimeout(() => connect(name), delay);
   };
 }
 
@@ -320,6 +321,10 @@ function handle(msg) {
 
     case 'library':
       refreshLibrary();
+      // The rendition may have just been (re)built — a wiped cache, or an
+      // encode that finished while we were pointed at a missing file. Retry
+      // instead of leaving the player dead until a manual reload.
+      if (state.media && el.video.error) retryPlayback();
       return;
 
     case 'lock':
@@ -526,6 +531,32 @@ function destroySubs() {
   if (old) old.remove();
 }
 
+function withRetryParam(url) {
+  try {
+    const parsed = new URL(url, window.location.origin);
+    parsed.searchParams.set('r', String(Date.now()));
+    return parsed.pathname + parsed.search;
+  } catch {
+    return url;
+  }
+}
+
+/** Re-attach the current episode after a failed load, a few times at most. */
+function retryPlayback() {
+  if (!state.media) return;
+  state.loadRetries = (state.loadRetries || 0) + 1;
+  if (state.loadRetries > 6) {
+    toast('That episode could not be rebuilt — check the server log.', 'error');
+    return;
+  }
+  setBadge('rebuilding episode…', 'ok');
+  setTimeout(() => {
+    if (!state.media) return;
+    loadMedia(state.media, { force: true });
+    if (state.room?.state?.playing) requestPlay();
+  }, Math.min(5000, 1500 * state.loadRetries));
+}
+
 /**
  * The room's episode vanished from the library (deleted file, cleared cache).
  * Put the stage back to a clean empty state instead of leaving a dead URL in
@@ -550,9 +581,9 @@ function clearMedia() {
   updateTimeUI();
 }
 
-function loadMedia(media) {
+function loadMedia(media, { force = false } = {}) {
   if (!media || !media.playbackUrl) return;
-  if (state.media?.id === media.id && el.video.src) {
+  if (!force && state.media?.id === media.id && el.video.src) {
     state.media = media;
     updateMetaUI();
     return;
@@ -564,7 +595,9 @@ function loadMedia(media) {
   setRate(1);
 
   el.video.pause();
-  el.video.src = media.playbackUrl;
+  // A forced reload gets a fresh URL: Chrome is happy to reuse the failed
+  // response for the same URL, which would make the retry pointless.
+  el.video.src = force ? withRetryParam(media.playbackUrl) : media.playbackUrl;
   el.video.poster = media.poster || '';
   el.video.load();
   state.loadStartedAt = performance.now();
@@ -1062,9 +1095,19 @@ el.video.addEventListener('ended', () => {
 
 el.video.addEventListener('waiting', () => send({ t: 'buffering', value: true }, { quiet: true }));
 el.video.addEventListener('playing', () => send({ t: 'buffering', value: false }, { quiet: true }));
-el.video.addEventListener('canplay', () => send({ t: 'buffering', value: false }, { quiet: true }));
+el.video.addEventListener('canplay', () => {
+  state.loadRetries = 0;
+  send({ t: 'buffering', value: false }, { quiet: true });
+});
 el.video.addEventListener('error', () => {
-  if (el.video.error) toast(`Playback error: ${el.video.error.message || 'unknown'}`, 'error');
+  if (!el.video.error) return;
+  // A 409 from the server means "the file is being rebuilt" — wait for it
+  // rather than telling the user their episode is broken.
+  if (state.media && state.loadRetries < 3) {
+    retryPlayback();
+    return;
+  }
+  toast(`Playback error: ${el.video.error.message || 'unknown'}`, 'error');
 });
 el.video.addEventListener('play', () => {
   setPlayIcon(true);
