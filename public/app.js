@@ -307,6 +307,7 @@ function handle(msg) {
       }
       if (previous && previous.playing !== msg.playing) {
         el.stage.classList.toggle('paused', !msg.playing);
+        showControls({ sticky: !msg.playing });
         setPlayIcon(msg.playing);
       }
       return;
@@ -646,6 +647,7 @@ function clearMedia() {
   detachTextTracks();
   closeTrackMenu();
   closeQualityMenu();
+  hideControls();
   el.qualityBtn.classList.add('hidden');
   el.video.pause();
   el.video.removeAttribute('src');
@@ -836,6 +838,7 @@ function applyTracks({ keepPosition = true, force = false } = {}) {
   renderTrackMenu();
   renderQualityMenu();
   updateMetaUI();
+  showControls();
 }
 
 /**
@@ -1048,14 +1051,46 @@ function toggleTrackMenu() {
 }
 
 function openTrackMenu() {
+  showControls({ sticky: true });
   renderTrackMenu();
   el.trackMenu.classList.remove('hidden');
   el.subsBtn.setAttribute('aria-expanded', 'true');
 }
 
 function closeTrackMenu() {
+  showControls();
   el.trackMenu.classList.add('hidden');
   el.subsBtn.setAttribute('aria-expanded', 'false');
+}
+
+let controlsTimer = null;
+
+/**
+ * Reveal the control bar, then let it fade after a few idle seconds.
+ *
+ * Visibility used to be driven by CSS alone (`:hover`, `:focus-within`), which
+ * meant a pointer resting over the picture - or a volume/seek slider that kept
+ * focus after being clicked - pinned the bar on screen indefinitely. That is the
+ * "line at the bottom that does not disappear".
+ */
+function showControls({ sticky = false } = {}) {
+  el.stage.classList.add('active-controls');
+  clearTimeout(controlsTimer);
+  if (sticky) return;
+  controlsTimer = setTimeout(() => {
+    if (el.stage.classList.contains('paused')) return;
+    if (!el.trackMenu.classList.contains('hidden') || !el.qualityMenu.classList.contains('hidden')) return;
+    el.stage.classList.remove('active-controls');
+    // Range inputs keep focus after a mouse click; that must not count as
+    // "still interacting". Buttons keep focus so keyboard users stay put.
+    const focused = document.activeElement;
+    if (focused instanceof HTMLInputElement && el.stage.contains(focused)) focused.blur();
+  }, 2800);
+}
+
+function hideControls() {
+  clearTimeout(controlsTimer);
+  el.stage.classList.remove('active-controls');
 }
 
 function renderQualityMenu() {
@@ -1095,6 +1130,7 @@ function renderQualityMenu() {
 
 function toggleQualityMenu() {
   if (el.qualityMenu.classList.contains('hidden')) {
+    showControls({ sticky: true });
     renderQualityMenu();
     closeTrackMenu();
     el.qualityMenu.classList.remove('hidden');
@@ -1105,6 +1141,7 @@ function toggleQualityMenu() {
 }
 
 function closeQualityMenu() {
+  showControls();
   el.qualityMenu.classList.add('hidden');
   el.qualityBtn?.setAttribute('aria-expanded', 'false');
 }
@@ -1923,7 +1960,14 @@ function setVolume(value) {
   // The video element stays silent whenever an alternate track is in charge,
   // otherwise a volume change would play both tracks at once.
   el.video.muted = level === 0 || Boolean(state.userMuted) || state.altActive;
+  paintVolume(level);
   localStorage.setItem('anisync:volume', String(level));
+}
+
+/** Keep the slider's filled portion in step with the level (and with mute). */
+function paintVolume(level = Number(el.volume.value)) {
+  const effective = state.userMuted ? 0 : level;
+  el.volume.style.setProperty('--volume', `${Math.round(effective * 100)}%`);
 }
 
 function setMuted(muted) {
@@ -1933,10 +1977,15 @@ function setMuted(muted) {
   el.video.muted = muted || state.altActive;
   el.altAudio.muted = muted;
   el.muteBtn.classList.toggle('on', muted);
+  paintVolume();
 }
 
 el.volume.addEventListener('input', () => setVolume(el.volume.value));
 el.muteBtn.addEventListener('click', () => setMuted(!state.userMuted));
+
+for (const type of ['pointermove', 'pointerdown', 'focusin']) {
+  el.stage.addEventListener(type, () => showControls());
+}
 
 el.subsBtn.addEventListener('click', (event) => {
   event.stopPropagation();

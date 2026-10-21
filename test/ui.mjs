@@ -1252,6 +1252,81 @@ await scenario('upload progress tells the truth', async () => {
   check('the survivors end up preparing and ready', ready, JSON.stringify(await a.evaluate(() => window.__uploadPhases)), a);
 });
 
+await scenario('the control bar fades while playing', async () => {
+  // A pointer resting over the picture, or a slider that kept focus after a
+  // click, used to pin the bar on screen for the whole episode.
+  const a = await join(await newPage(), 'Wes');
+  await openEpisode(a, DEMO);
+  await click(a, '#playBtn');
+  await sleep(1200);
+
+  // Puppeteer's synthetic mouse moves do not always produce a pointermove in
+  // headless Chrome, so poke the element the way the browser would.
+  const nudge = () =>
+    a.evaluate(() => {
+      const stage = document.getElementById('stage');
+      stage.dispatchEvent(new PointerEvent('pointermove', { bubbles: true }));
+      return stage.classList.contains('active-controls');
+    });
+  await a.mouse.move(400, 300);
+  check('activity brings the controls up', await nudge(), '', a);
+
+  // Click the volume slider: in Firefox the range input keeps focus, which was
+  // the trigger for the bar never going away.
+  const box = await (await a.$('#volume')).boundingBox();
+  await a.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await sleep(400);
+
+  const faded = await waitFor(
+    a,
+    () => !document.getElementById('stage').classList.contains('active-controls'),
+    8000,
+    'controls fade',
+  );
+  check('they fade out once the pointer is still', faded, '', a);
+  // The fade is a 0.22s transition; poll inside the page and read the result in
+  // the same evaluation, so nothing can re-show the bar between two calls.
+  const style = await a.evaluate(async () => {
+    const read = () => {
+      const css = getComputedStyle(document.getElementById('controls'));
+      return {
+        opacity: css.opacity,
+        pointerEvents: css.pointerEvents,
+        stage: document.getElementById('stage').className,
+      };
+    };
+    for (let i = 0; i < 40; i += 1) {
+      if (read().opacity === '0') break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return read();
+  });
+  check(
+    'the bar is invisible and not clickable while hidden',
+    style.opacity === '0' && style.pointerEvents === 'none',
+    JSON.stringify(style),
+    a,
+  );
+
+  check('and come back on movement', await nudge(), '', a);
+
+  // Paused must pin them, otherwise there is no way to see the timeline.
+  await click(a, '#playBtn');
+  await sleep(600);
+  await nudge();
+  await sleep(3600);
+  const pausedBar = await a.evaluate(() => ({
+    active: document.getElementById('stage').classList.contains('active-controls'),
+    paused: document.getElementById('stage').classList.contains('paused'),
+    opacity: getComputedStyle(document.getElementById('controls')).opacity,
+  }));
+  check('pausing keeps the bar on screen', pausedBar.paused && pausedBar.opacity === '1', JSON.stringify(pausedBar), a);
+
+  // The volume slider must paint its filled portion.
+  const volumeVar = await a.evaluate(() => document.getElementById('volume').style.getPropertyValue('--volume'));
+  check('the volume slider knows its level', /^\d+%$/.test(volumeVar), volumeVar || '(unset)', a);
+});
+
 await scenario('a reload reports the files it cut short', async () => {
   const a = await newPage();
   await a.goto(BASE, { waitUntil: 'domcontentloaded' });

@@ -227,9 +227,15 @@ body {
   transition: opacity 0.22s ease, transform 0.22s ease;
   z-index: 3;
 }
-.stage:hover .controls,
-.stage:focus-within .controls,
+/* Shown while there is recent pointer/keyboard activity, and whenever paused.
+   Hover and focus are deliberately NOT the trigger: a pointer resting over the
+   picture, or a range input that kept focus after a click, used to pin the bar
+   on screen forever ("the line at the bottom does not disappear"). */
+.stage.active-controls .controls,
 .stage.paused .controls { opacity: 1; transform: none; }
+/* Nothing to click once it is hidden, and no cursor to stare at. */
+.stage:not(.active-controls):not(.paused) .controls { pointer-events: none; }
+.stage:not(.active-controls):not(.paused) { cursor: none; }
 
 .seek {
   -webkit-appearance: none;
@@ -277,9 +283,27 @@ body {
 .spacer { flex: 1; }
 
 .volume { -webkit-appearance: none; appearance: none; width: 74px; height: 18px; background: transparent; cursor: pointer; }
-.volume::-webkit-slider-runnable-track { height: 3px; border-radius: 999px; background: rgba(255, 255, 255, 0.28); }
-.volume::-webkit-slider-thumb { -webkit-appearance: none; width: 11px; height: 11px; margin-top: -4px; border-radius: 50%; background: #fff; }
-.volume::-moz-range-thumb { width: 11px; height: 11px; border: 0; border-radius: 50%; background: #fff; }
+.volume::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 999px;
+  background: linear-gradient(to right, rgba(255, 255, 255, 0.62) var(--volume, 100%), rgba(255, 255, 255, 0.22) var(--volume, 100%));
+}
+.volume::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 11px; height: 11px; margin-top: -3.5px;
+  border-radius: 50%; background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+}
+/* Firefox: without a ::-moz-range-track the input falls back to a native track
+   that renders black over a dark picture - which is what "his volume thing is
+   black" was. */
+.volume::-moz-range-track { height: 4px; border-radius: 999px; background: rgba(255, 255, 255, 0.22); }
+.volume::-moz-range-progress { height: 4px; border-radius: 999px; background: rgba(255, 255, 255, 0.62); }
+.volume::-moz-range-thumb {
+  width: 11px; height: 11px; border: 0;
+  border-radius: 50%; background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+}
 
 .stage-meta {
   flex: 0 0 auto;
@@ -548,10 +572,9 @@ body {
   .stage-meta h1 { font-size: 15px; }
 }
 
-/* Touch devices never hover, so the controls would never appear. */
-@media (hover: none) {
-  .controls { opacity: 1; transform: none; }
-}
+/* Touch devices: a tap fires pointerdown, which reveals the bar through the
+   same state machine as a mouse move. Forcing it visible here would defeat the
+   fade (and headless browsers report hover: none too). */
 
 @media (prefers-reduced-motion: reduce) {
   * { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
