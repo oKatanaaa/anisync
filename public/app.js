@@ -2181,7 +2181,18 @@ el.joinForm.addEventListener('submit', (event) => {
 });
 
 el.playBtn.addEventListener('click', togglePlay);
-el.video.addEventListener('click', togglePlay);
+let videoClickTimer = null;
+el.video.addEventListener('click', (event) => {
+  clearTimeout(videoClickTimer);
+  if (event.detail > 1) return;
+  // Wait briefly so a double-click does not pause or resume the whole room.
+  videoClickTimer = setTimeout(togglePlay, 300);
+});
+el.video.addEventListener('dblclick', (event) => {
+  event.preventDefault();
+  clearTimeout(videoClickTimer);
+  toggleFullscreen();
+});
 
 for (const button of el.controls.querySelectorAll('[data-skip]')) {
   button.addEventListener('click', () => {
@@ -2257,10 +2268,12 @@ document.addEventListener('click', (event) => {
   }
 });
 
-el.fsBtn.addEventListener('click', () => {
+function toggleFullscreen() {
   if (document.fullscreenElement) document.exitFullscreen();
   else el.stage.requestFullscreen?.();
-});
+}
+
+el.fsBtn.addEventListener('click', toggleFullscreen);
 
 el.gate.addEventListener('click', () => {
   showGate(false);
