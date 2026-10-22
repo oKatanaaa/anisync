@@ -10,8 +10,8 @@ export const config = {
   bind: process.env.BIND || '0.0.0.0',
   password: process.env.PASSWORD || '',
 
-  mediaDir: process.env.MEDIA_DIR || path.join(root, 'media'),
-  cacheDir: process.env.CACHE_DIR || path.join(root, 'cache'),
+  mediaDir: path.resolve(process.env.MEDIA_DIR || path.join(root, 'media')),
+  cacheDir: path.resolve(process.env.CACHE_DIR || path.join(root, 'cache')),
 
   /** The brief: three people, no more. */
   maxViewers: num(process.env.MAX_VIEWERS, 3),

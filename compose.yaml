@@ -26,12 +26,13 @@ services:
         target: /data/media
         bind:
           create_host_path: false
-      - cache:/data/cache
+      - type: bind
+        source: ${CACHE_DIR:-./cache}
+        target: /data/cache
+        bind:
+          create_host_path: false
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
-
-volumes:
-  cache:

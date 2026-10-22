@@ -9,16 +9,13 @@ embedded fonts and external tracks. Files are prepared once with FFmpeg and cach
 Requires Docker with the Compose plugin.
 
 Copy `.env.example` to `.env` and set `PASSWORD` to your shared login password.
-Set `MEDIA_DIR` to an existing video folder on the Docker host (default `./media`).
-On Linux, the folder must be writable by UID/GID `1000:1000` and videos readable.
-To create the default folder on a fresh Linux deployment:
+Set `MEDIA_DIR` and `CACHE_DIR` to existing folders on the Docker host (defaults
+`./media` and `./cache`). Keep them separate. On Linux, both must be writable by
+UID/GID `1000:1000` and videos readable. For a fresh Linux deployment:
 
 ```sh
-mkdir -p media
-sudo chown 1000:1000 media
-```
-
-```sh
+mkdir -p media cache
+sudo chown 1000:1000 media cache
 docker compose up -d --build
 ```
 
@@ -27,9 +24,8 @@ panel, wait for preparation, then pick an episode. The room limit is three viewe
 
 The image includes Node.js 24, FFmpeg and fonts, runs as a non-root user, and uses
 CPU encoding. The deployment includes a health check, automatic restarts and bounded
-logs. Videos and uploads stay in your host folder; prepared media and the room's
-saved position use a persistent Docker cache volume. `docker compose down` keeps
-both; adding `-v` deletes the cache volume, while your video folder stays intact.
+logs. Videos, uploads, prepared media and saved room state stay in your host
+folders. Removing containers, including `docker compose down -v`, keeps both folders.
 
 ```sh
 docker compose logs -f                  # logs
@@ -38,10 +34,11 @@ docker compose up -d --build            # rebuild after pulling updates
 docker compose down                    # stop
 ```
 
-Change `MEDIA_DIR` in `.env` to use another host folder, for example `/srv/videos`
-or `D:/Videos` on Windows. Relative paths resolve from this project for Compose.
-Copy files there and click **Rescan folder**. Changing the path does not move
-existing files; when upgrading from Docker's media volume, copy those files first.
+Change `MEDIA_DIR` and `CACHE_DIR` in `.env` to use other host folders, for example
+`/srv/videos` and `/srv/anisync-cache`, or `D:/Videos` and `D:/AniSyncCache` on Windows.
+Relative paths resolve from this project for Compose. Copy videos into `MEDIA_DIR`
+and click **Rescan folder**. Changing paths does not move existing files; when
+upgrading from Docker's media/cache volumes, copy their contents first.
 Keep space for the source files, transcodes and HLS packages.
 
 ### Let friends connect
@@ -70,6 +67,7 @@ Copy `.env.example` to `.env`, change what you need, then run
 | `PORT` | `8080` | Published port (container always uses 8080) |
 | `PASSWORD` | required | Shared login password; changing it invalidates existing sessions |
 | `MEDIA_DIR` | `./media` | Video folder on the host, mounted into the container |
+| `CACHE_DIR` | `./cache` | Prepared media and saved room state folder on the host |
 | `MAX_VIEWERS` | `3` | Room capacity |
 | `ENCODER` | `x264` | CPU encoding; hardware encoders need GPU access configured separately |
 | `SUBTITLES` | `bake` | `bake` preserves ASS styling; `track` uses soft WebVTT; `off` disables subtitles |
