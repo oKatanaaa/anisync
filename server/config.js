@@ -8,6 +8,7 @@ export const config = {
   root,
   port: num(process.env.PORT, 8080),
   bind: process.env.BIND || '0.0.0.0',
+  password: process.env.PASSWORD || '',
 
   mediaDir: process.env.MEDIA_DIR || path.join(root, 'media'),
   cacheDir: process.env.CACHE_DIR || path.join(root, 'cache'),

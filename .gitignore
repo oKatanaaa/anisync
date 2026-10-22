@@ -4,3 +4,4 @@ media/
 *.log
 .DS_Store
 test/*.tmp.mjs
+.env

@@ -12,6 +12,7 @@ import { Library, isMediaId } from './media.js';
 import { Room } from './rooms.js';
 import { detectEncoder, killAll, runningChildren } from './ffmpeg.js';
 import { HlsCache, isRendition, isHlsAsset } from './hls.js';
+import { createAuth } from './auth.js';
 
 const log = (...args) => console.log(new Date().toISOString(), ...args);
 
@@ -141,13 +142,16 @@ async function loadRoom() {
 // ---------------------------------------------------------------------------
 
 const app = express();
+const auth = createAuth(config);
 app.disable('x-powered-by');
 app.use(express.json({ limit: '64kb' }));
+app.use(auth.middleware);
+app.get('/api/session', (_req, res) => res.json({ ok: true }));
 
 app.use('/shared', express.static(path.join(config.root, 'shared'), { maxAge: '1h' }));
 app.get('/vendor/hls.mjs', (_req, res) => res.sendFile(path.join(config.root, 'node_modules/hls.js/dist/hls.min.mjs'), { maxAge: '1h' }));
 app.use(express.static(path.join(config.root, 'public'), { maxAge: '5m', index: 'index.html',
-  setHeaders: (res, file) => { if (file.endsWith('.html')) res.set('Cache-Control', 'no-cache'); },
+  setHeaders: (res, file) => { if (file.endsWith('.html')) res.set('Cache-Control', 'private, no-cache'); },
 }));
 
 app.get('/api/health', async (_req, res) => {
@@ -308,7 +312,7 @@ app.get('/media/:id/video.mp4', (req, res) => {
     return res.status(409).json({ error: 'not ready', repreparing: Boolean(item) });
   }
   res.sendFile(file, {
-    headers: { 'Cache-Control': 'public, max-age=31536000, immutable' },
+    headers: { 'Cache-Control': 'private, max-age=31536000, immutable' },
     acceptRanges: true,
     cacheControl: false,
   });
@@ -329,7 +333,7 @@ app.get('/media/:id/video.clean.mp4', (req, res) => {
     return res.status(409).json({ error: 'not ready', repreparing: Boolean(item) });
   }
   res.sendFile(file, {
-    headers: { 'Cache-Control': 'public, max-age=31536000, immutable' },
+    headers: { 'Cache-Control': 'private, max-age=31536000, immutable' },
     acceptRanges: true,
     cacheControl: false,
   });
@@ -362,7 +366,7 @@ app.get('/media/:id/quality/:height/:kind', (req, res) => {
   // Same immutable policy as the main rendition: the URL carries the source
   // version, so a rebuilt file can never be served from a stale cache entry.
   res.sendFile(file, {
-    headers: { 'Cache-Control': 'public, max-age=31536000, immutable' },
+    headers: { 'Cache-Control': 'private, max-age=31536000, immutable' },
     acceptRanges: true,
     cacheControl: false,
   });
@@ -372,25 +376,25 @@ app.get('/media/:id/quality/:height/:kind', (req, res) => {
 app.get('/media/:id/audio/:file', (req, res) => {
   const { id, file } = req.params;
   if (!isMediaId(id) || !/^\d+\.m4a$/.test(file)) return res.status(400).end();
-  sendIfExists(res, path.join(config.cacheDir, id, 'audio', file), { 'Cache-Control': 'public, max-age=31536000, immutable' });
+  sendIfExists(res, path.join(config.cacheDir, id, 'audio', file), { 'Cache-Control': 'private, max-age=31536000, immutable' });
 });
 
 app.get('/media/:id/poster.jpg', (req, res) => {
   if (!isMediaId(req.params.id)) return res.status(400).end();
-  sendIfExists(res, path.join(config.cacheDir, req.params.id, 'poster.jpg'), { 'Cache-Control': 'public, max-age=86400' });
+  sendIfExists(res, path.join(config.cacheDir, req.params.id, 'poster.jpg'), { 'Cache-Control': 'private, max-age=86400' });
 });
 
 app.get('/media/:id/subs/:file', (req, res) => {
   const { id, file } = req.params;
   if (!isMediaId(id) || !/^\d+\.(ass|vtt)$/.test(file)) return res.status(400).end();
-  sendIfExists(res, path.join(config.cacheDir, id, 'subs', file), { 'Cache-Control': 'public, max-age=86400' });
+  sendIfExists(res, path.join(config.cacheDir, id, 'subs', file), { 'Cache-Control': 'private, max-age=86400' });
 });
 
 app.get('/media/:id/fonts/:file', (req, res) => {
   const { id, file } = req.params;
   const safe = path.basename(file);
   if (!isMediaId(id) || safe !== file || !/\.(ttf|otf|ttc|woff2)$/i.test(safe)) return res.status(400).end();
-  sendIfExists(res, path.join(config.cacheDir, id, 'fonts', safe), { 'Cache-Control': 'public, max-age=86400' });
+  sendIfExists(res, path.join(config.cacheDir, id, 'fonts', safe), { 'Cache-Control': 'private, max-age=86400' });
 });
 
 app.use((err, _req, res, _next) => {
@@ -413,7 +417,14 @@ const wss = new WebSocketServer({ noServer: true, maxPayload: 256 * 1024 });
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, 'http://localhost');
   if (url.pathname !== '/ws') return socket.destroy();
-  wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, url));
+  if (!auth.authenticated(req) || !auth.sameOrigin(req)) {
+    socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    ws.authRequest = req;
+    wss.emit('connection', ws, url);
+  });
 });
 
 const cleanName = (name) => String(name ?? '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 24) || 'Guest';
@@ -539,6 +550,10 @@ wss.on('connection', (ws, url) => {
 // Drop dead sockets so a sleeping laptop does not stay in the room forever.
 const heartbeat = setInterval(() => {
   for (const [ws, entry] of clients) {
+    if (!auth.authenticated(ws.authRequest)) {
+      ws.close(4003, 'sign in again');
+      continue;
+    }
     if (!entry.alive) {
       ws.terminate();
       continue;

@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="referrer" content="no-referrer">
+<title>Sign in — AniSync</title>
+<link rel="icon" href="data:,">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100dvh; display: grid; place-items: center; padding: 24px; background: #101019; color: #eeeef5; font: 16px system-ui, sans-serif; }
+  form { width: min(100%, 360px); padding: 32px; border: 1px solid #343143; border-radius: 20px; background: #1b1928; }
+  h1 { margin: 0 0 8px; font-size: 28px; }
+  p { color: #b6b2c9; line-height: 1.5; }
+  label { display: block; margin-top: 24px; }
+  input, button { width: 100%; margin-top: 10px; border-radius: 10px; padding: 12px; font: inherit; }
+  input { border: 1px solid #59536f; background: #101019; color: inherit; }
+  input:focus-visible, button:focus-visible { outline: 2px solid #b6a0ff; outline-offset: 3px; }
+  button { border: 0; background: #9a78f5; color: #100b20; font-weight: 650; cursor: pointer; }
+  button:disabled { opacity: .6; cursor: wait; }
+  #error { min-height: 24px; margin-bottom: 0; color: #ffb2bc; }
+</style>
+</head>
+<body>
+<form id="loginForm">
+  <h1>AniSync</h1>
+  <p>Enter the shared password to join.</p>
+  <label for="password">Password</label>
+  <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+  <button type="submit">Continue</button>
+  <p id="error" role="alert" aria-live="polite"></p>
+</form>
+<script>
+  const form = document.getElementById('loginForm');
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const button = form.querySelector('button');
+    const error = document.getElementById('error');
+    button.disabled = true;
+    error.textContent = '';
+    try {
+      const response = await fetch('/api/login', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: form.elements.password.value }),
+      });
+      if (response.ok) { location.replace('/'); return; }
+      error.textContent = (await response.json()).error || 'Unable to sign in';
+    } catch { error.textContent = 'Cannot reach AniSync. Try again.'; }
+    button.disabled = false;
+  });
+</script>
+</body>
+</html>

@@ -187,8 +187,9 @@ function connect(name) {
     handle(msg);
   };
 
-  ws.onclose = (event) => {
+  ws.onclose = async (event) => {
     stopPings();
+    if (event.code === 4003) { location.assign('/login'); return; }
     // Another tab took this seat over (same session id): don't fight it.
     if (event.code === 4002) {
       state.connectionTakenOver = true;
@@ -199,6 +200,10 @@ function connect(name) {
       showJoin('The room is full — three seats only.');
       return;
     }
+    try {
+      const session = await fetch('/api/session', { cache: 'no-store', signal: AbortSignal.timeout(4000) });
+      if (session.status === 401) { location.assign('/login'); return; }
+    } catch { /* Offline: retain the normal reconnect loop. */ }
     // Keep trying forever: a watch party lasts hours and Wi-Fi blips. The delay
     // is capped, and jittered so three clients do not stampede a restarting
     // server in lockstep.
