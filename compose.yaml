@@ -21,7 +21,11 @@ services:
       START_DELAY_MS: ${START_DELAY_MS:-1200}
       SEEK_DELAY_MS: ${SEEK_DELAY_MS:-700}
     volumes:
-      - media:/data/media
+      - type: bind
+        source: ${MEDIA_DIR:-./media}
+        target: /data/media
+        bind:
+          create_host_path: false
       - cache:/data/cache
     logging:
       driver: json-file
@@ -30,5 +34,4 @@ services:
         max-file: "3"
 
 volumes:
-  media:
   cache:
