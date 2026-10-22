@@ -315,9 +315,11 @@ body {
 }
 .seek::-moz-range-thumb { width: 13px; height: 13px; border: 0; border-radius: 50%; background: #fff; }
 
-.controls-row { display: flex; align-items: center; gap: 8px; }
+.controls-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.skip-controls { display: flex; flex: none; align-items: center; gap: 2px; }
 
 .icon-btn {
+  flex-shrink: 0;
   width: 36px; height: 36px;
   display: grid; place-items: center;
   border: 0; border-radius: 10px;
@@ -331,7 +333,7 @@ body {
 .icon-btn.hidden { display: none; }
 .text-btn { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; width: auto; padding: 0 9px; }
 
-.time { font-size: 12.5px; color: rgba(255, 255, 255, 0.82); font-variant-numeric: tabular-nums; }
+.time { font-size: 12.5px; color: rgba(255, 255, 255, 0.82); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .spacer { flex: 1; }
 
 .volume { -webkit-appearance: none; appearance: none; width: 74px; height: 18px; background: transparent; cursor: pointer; }

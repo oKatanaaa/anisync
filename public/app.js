@@ -42,6 +42,7 @@ const el = {
   volume: $('volume'),
   subsBtn: $('subsBtn'),
   fsBtn: $('fsBtn'),
+  syncBtn: $('syncBtn'),
   syncBadge: $('syncBadge'),
   roomChip: $('roomChip'),
   avatars: $('avatars'),
@@ -2119,6 +2120,13 @@ el.joinForm.addEventListener('submit', (event) => {
 el.playBtn.addEventListener('click', togglePlay);
 el.video.addEventListener('click', togglePlay);
 
+for (const button of el.controls.querySelectorAll('[data-skip]')) {
+  button.addEventListener('click', () => {
+    if (!state.room || !state.media) return;
+    seekTo((el.video.currentTime || 0) + Number(button.dataset.skip));
+  });
+}
+
 el.seek.addEventListener('pointerdown', () => {
   state.dragging = true;
 });
@@ -2201,7 +2209,7 @@ el.gate.addEventListener('click', () => {
   requestPlay();
 });
 
-el.syncBadge.addEventListener('click', () => {
+function resyncToRoom() {
   const roomState = state.room?.state;
   if (!roomState) return;
   const expected = expectedPosition(roomState, serverNow());
@@ -2210,7 +2218,10 @@ el.syncBadge.addEventListener('click', () => {
   setRate(1);
   state.nudging = false;
   toast('resynced to the room');
-});
+}
+
+el.syncBadge.addEventListener('click', resyncToRoom);
+el.syncBtn.addEventListener('click', resyncToRoom);
 
 el.lockBtn.addEventListener('click', () => {
   send({ t: 'lock', value: !state.room?.locked });
