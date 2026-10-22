@@ -56,7 +56,7 @@ export function pickOffset(samples, windowSize = 9) {
  */
 export function expectedPosition(state, serverNow) {
   if (!state) return 0;
-  if (!state.playing) return state.position;
+  if (!state.playing || state.buffering) return state.position;
   const elapsed = (serverNow - state.anchor) / 1000;
   if (elapsed <= 0) return state.position; // scheduled start hasn't fired yet
   return state.position + elapsed * (state.rate || 1);
@@ -64,7 +64,7 @@ export function expectedPosition(state, serverNow) {
 
 /** True while a play/seek is scheduled but hasn't reached its start time yet. */
 export function inPreRoll(state, serverNow) {
-  return Boolean(state && state.playing && serverNow < state.anchor);
+  return Boolean(state && state.playing && !state.buffering && serverNow < state.anchor);
 }
 
 /**

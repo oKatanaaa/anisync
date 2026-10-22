@@ -12,7 +12,7 @@ Built for anime files specifically: 10-bit HEVC in Matroska, ASS subtitles with 
 │  browser B   │ ◀───────────────────────▶ │  · ffmpeg transcode queue  │
 └──────────────┘                           └────────────────────────────┘
       │                                                  │
-      └──────────── HTTP Range (video.mp4) ──────────────┘
+      └──────────── HTTP (HLS / MP4 fallback) ─────────┘
 ```
 
 ## How the sync works
@@ -23,7 +23,7 @@ The server never streams frames. It stores:
 { playing, position, anchor /* server ms */, rate }
 ```
 
-Clients reconstruct the expected position — `position + (serverNow - anchor) * rate` — and run a correction loop four times a second:
+Clients reconstruct the expected position — `position + (serverNow - anchor) * rate` — and run a correction loop five times a second. During a shared buffering hold, the position stays fixed:
 
 | drift | action |
 | --- | --- |
@@ -33,7 +33,22 @@ Clients reconstruct the expected position — `position + (serverNow - anchor) *
 
 Clock offset comes from NTP-style pings over the WebSocket (`offset = sts - (t0 + t3) / 2`), keeping the lowest-RTT sample from a sliding window. Play and seek are scheduled with a short lead time so everyone starts together instead of drifting in from different buffer states.
 
-Measured on two clients in the same browser, 12 s of continuous playback: **median gap 15–63 ms, p95 ≤ 186 ms**, and it settles back to exactly 1.0× rather than hunting.
+Before starting or seeking while playing, the room waits until each active viewer
+has **8 seconds buffered**. A sustained stall pauses the shared timeline; viewers
+refill to **12 seconds** before a scheduled resume. A deliberate pause cancels
+that resume. Short interruptions are tolerated, and routine drift correction
+never seeks into unbuffered video. Readiness is tied to the current episode and
+state version, so an old source load cannot release a new hold. A disconnected
+viewer stops blocking others after their reports expire (8 seconds).
+
+Playback uses **VOD HLS with a 60-second forward buffer target**, including
+alternate audio. This is downloaded media, not extra delay between viewers.
+Native playback falls back to a conservative 2-second readiness target when
+managed buffering is unavailable. The fullscreen card shows whether your player
+is building a reserve or waiting for someone else. This absorbs temporary
+bandwidth dips; a permanently insufficient link still needs a lower bitrate.
+
+Earlier MP4-only measurements on two clients in the same browser, over 12 s of continuous playback: **median gap 15–63 ms, p95 ≤ 186 ms**. The new outage regression checks that independent viewers resume within 400 ms after refilling.
 
 ## Media pipeline
 
@@ -41,11 +56,18 @@ Browsers cannot decode what anime ships in, so each file is prepared once, in th
 
 1. `ffprobe` → duration, resolution, codecs, subtitle tracks.
 2. Text subtitle tracks are extracted to `.ass` (and `.vtt`), embedded font attachments dumped out of the MKV.
-3. Video is re-encoded to H.264 8-bit + AAC stereo, `+faststart`, 2 s keyframe interval, capped at 1080p. Already-safe sources are remuxed with `-c copy` instead.
+3. Video is re-encoded to H.264 8-bit + AAC stereo, `+faststart`, 2 s keyframe interval, capped at 1080p. x264 uses the `medium` preset and a bounded quality encode; already-safe sources can be remuxed when `MAX_VIDEO_KBPS=0` disables the bitrate ceiling.
 4. Subtitles are **burned in** with libass (`SUBTITLES=bake`), which preserves ASS typesetting, signs and karaoke exactly, and needs no browser-side WASM.
 5. A poster frame is grabbed for the library grid.
+6. On first playback of a rendition, FFmpeg packages that cached MP4 into fMP4 HLS segments **without re-encoding**. Concurrent viewers reuse the same atomic package; changed MP4s get new immutable segment URLs. If packaging fails or storage is insufficient, the player can use the original MP4.
 
 Everything lands in `cache/<id>/` keyed by the source's size+mtime, so restarts and re-scans never re-encode.
+
+Existing prepared MP4s remain usable and gain segmented playback on demand. New
+encoder settings apply to future encodes; this update does not automatically
+re-encode your library. HLS packages duplicate approximately the used rendition's
+size on disk, including any selected alternate audio, and are stored under
+`cache/<id>/hls/`. Removing an episode removes its derived packages too.
 
 ## Running it
 
@@ -81,14 +103,17 @@ All optional, via environment variables:
 | `ENCODER` | `auto` | `auto` \| `nvenc` \| `vaapi` \| `x264` |
 | `MAX_HEIGHT` | `1080` | cap for the stored rendition |
 | `CRF` | `21` | x264 quality (lower = bigger/better) |
+| `X264_PRESET` | `medium` | Encode once more efficiently; `veryfast` reduces preparation time |
+| `MAX_VIDEO_KBPS` | `3500` | 1080p video ceiling; scaled down to about 1905 at 720p and 1037 at 480p, with a 2-second VBV buffer; audio is additional. `0` enables uncapped encoding/remuxing |
 | `START_DELAY_MS` | `1200` | lead time on a scheduled start |
 | `SEEK_DELAY_MS` | `700` | lead time after a seek |
 
 ## Testing
 
 ```bash
-npm test          # 72 unit tests: sync math, rooms, hardening, subtitles, sidecars
+npm test          # sync, room, media, HLS, rate-control and hardening checks
 npm run test:ui   # 131 checks driving the real UI in real Chrome
+npm run test:playback # isolated two-browser outage, quality-switch and audio regression
 ```
 
 `npm run test:ui` needs the server running. Scenarios whose name matches an
@@ -97,6 +122,15 @@ argument run alone:
 ```bash
 npm run test:ui -- "end of episode"
 ```
+
+`npm run test:playback` starts its own temporary server, generates a 90-second
+fixture, and uses two independent browsers. It interrupts real HLS delivery at
+both 1080p and 720p, checks shared refill/resume, delayed and rapid quality
+switches, alternate audio, and recovery through the MP4 fallback. It needs FFmpeg
+and Chrome; set `PUPPETEER_EXECUTABLE_PATH` for a nonstandard Chrome installation.
+`PLAYBACK_TEST_OUT` selects where screenshots and measurements are saved.
+Restart the app and reload all viewers after updating, so everyone uses the new
+buffering protocol and matching versioned browser assets.
 
 Every check asserts on something a person would see or hear — the seat chip, the
 drift badge, the toast text, the frame on screen — rather than on internals. The
@@ -109,8 +143,8 @@ three-seat cap, and surviving a server restart.
 
 Sync quality is measured with **three separate browser processes**, because
 Chrome will not buffer video in a backgrounded tab — three tabs in one browser
-measures the backgrounding heuristic, not the sync engine. Current numbers on
-loopback: median 2 ms, p95 34 ms between the three players.
+measures the backgrounding heuristic, not the sync engine. Earlier MP4-only
+loopback measurements: median 2 ms, p95 34 ms between the three players.
 
 `test/rooms.test.js` deliberately passes a *transport-shaped* user object
 (`{id, name}`, no `isHost`) to `apply()`, because that is exactly what
@@ -172,9 +206,9 @@ multi-gigabyte episodes, copying the files into `media/` over the LAN and hittin
 
 A 4K file is **never streamed at 4K**. Sources above `MAX_HEIGHT` (default
 **1080**) are re-encoded down to that height, so the browser receives 1920×1080
-at roughly 3–6 Mbps — decodable in hardware by any phone or laptop from the last
-decade. Streams are only remuxed untouched when they are already browser-friendly
-*and* within the cap; a 4K H.264 file is re-encoded rather than copied, precisely
+at the configured video bitrate ceiling plus audio. Streams are only remuxed
+untouched when bitrate limiting is disabled and they are browser-friendly
+*and* within the resolution cap; a 4K H.264 file is re-encoded rather than copied, precisely
 so it cannot slip through at 2160p. Set `MAX_HEIGHT=720` if the people watching
 are on a weak link (it roughly halves the bitrate).
 
@@ -218,9 +252,10 @@ second element, kept in step by the same drift controller that syncs the room.
 builds a second rendition on the server the first time (a couple of minutes,
 with the progress shown in the menu while the sharp one keeps playing), then
 switches the player without a reload. The sharper file is never replaced or
-deleted: switching back is instant, and the two copies live side by side in the
+deleted: switching back needs no further encode, and the two copies live side by side in the
 episode's cache, never as separate library cards. Per viewer, like the other
-tracks. Measured on a 28-minute episode: **1080p 2.17 Mbps / 504 MB** versus
+tracks. The selected source builds a reserve before synchronized playback resumes.
+Earlier measurements on a 28-minute episode: **1080p 2.17 Mbps / 504 MB** versus
 **720p 1.17 Mbps / 291 MB** — about half the bandwidth for a phone on a relayed
 link. Extra rungs can be added with `ALT_HEIGHTS=720,480`.
 
@@ -284,6 +319,11 @@ What made the difference:
 The failure modes that matter for a three-hour session are blackouts, not
 crashes: a laptop sleeping, Wi-Fi dropping, an encode wedging, a disk filling.
 
+- **Playback status stays visible in fullscreen.** A small glass card appears
+  when playback buffers, with a lower-quality suggestion after a prolonged wait.
+  Offline or interrupted room connections get a separate warning, which stays
+  in the corner if video is still playing. Brief seeks and deliberate pauses
+  do not show a buffering card; it clears automatically on recovery.
 - **A hung encode is killed.** `run()` has a stall watchdog (no output for 120 s)
   and a 6-hour ceiling, so a wedged ffmpeg cannot occupy the single-slot queue
   forever. Children are tracked and killed on shutdown, so a restart never leaves

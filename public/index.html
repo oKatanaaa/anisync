@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="dark" />
 <title>AniSync — watch together</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%238b5cf6'/%3E%3Cstop offset='1' stop-color='%23ec4899'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='16' fill='url(%23g)'/%3E%3Cpath d='M26 20l18 12-18 12z' fill='white'/%3E%3C/svg%3E" />
-<link rel="stylesheet" href="/style.css" />
+<link rel="stylesheet" href="/style.css?v=buffering-1" />
 </head>
 <body>
 <div class="aurora" aria-hidden="true"><span></span><span></span><span></span></div>
@@ -37,6 +37,21 @@
       <video id="video" playsinline preload="auto"></video>
       <!-- Alternate audio tracks play here while the video element is muted. -->
       <audio id="altAudio" preload="auto"></audio>
+
+      <div id="playbackStatus" class="playback-status hidden" role="status" aria-live="polite" aria-atomic="true">
+        <div class="playback-status-card">
+          <span class="playback-status-icon" aria-hidden="true">
+            <span class="playback-status-spinner"></span>
+            <svg class="playback-status-warning" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+              <path d="M4 9a12 12 0 0 1 16 0M7 12.5a7.5 7.5 0 0 1 10 0M10 16a3 3 0 0 1 4 0M12 19h.01M3 3l18 18" />
+            </svg>
+          </span>
+          <div class="playback-status-copy">
+            <strong id="playbackStatusTitle"></strong>
+            <p id="playbackStatusDetail"></p>
+          </div>
+        </div>
+      </div>
 
       <div class="track-menu quality-menu hidden" id="qualityMenu" role="dialog" aria-label="Video quality">
         <p class="track-title">Quality</p>
@@ -162,6 +177,6 @@
 
 <div id="toasts" class="toasts" aria-live="polite"></div>
 
-<script type="module" src="/app.js"></script>
+<script type="module" src="/app.js?v=buffering-1"></script>
 </body>
 </html>

@@ -5,13 +5,18 @@ import {
   inPreRoll,
   nextCorrection,
   describeDrift,
-} from '/shared/sync.js';
+} from '/shared/sync.js?v=buffering-1';
+import { BUFFER, bufferedAhead, requiredBuffer } from '/shared/playback.js?v=buffering-1';
+import { StreamPlayer } from '/stream-player.js?v=buffering-1';
 
 const $ = (id) => document.getElementById(id);
 
 const el = {
   video: $('video'),
   altAudio: $('altAudio'),
+  playbackStatus: $('playbackStatus'),
+  playbackStatusTitle: $('playbackStatusTitle'),
+  playbackStatusDetail: $('playbackStatusDetail'),
   trackMenu: $('trackMenu'),
   subGroup: $('subGroup'),
   subList: $('subList'),
@@ -65,9 +70,13 @@ const state = {
   room: null, // {state, locked, media, users, capacity}
   media: null,
   sourceUrl: null,
+  sourcePosition: 0,
+  lastPlaybackReportAt: 0,
+  lastPlaybackReportSeq: -1,
   mediaList: [],
   tracks: { sub: 'styled', audio: 0 },
   altActive: false,
+  audioUrl: null,
   userMuted: false,
   cleanPending: null,
   users: [],
@@ -79,12 +88,22 @@ const state = {
   gateVisible: false,
   loadStartedAt: 0,
   lastReloadAt: 0,
+  loadRetries: 0,
+  retryTimer: null,
+  lastPongAt: 0,
+  connectionTakenOver: false,
   name: localStorage.getItem('anisync:name') || '',
   retries: 0,
   pingTimer: null,
   libRefreshAt: 0,
   confirmDelete: null,
 };
+const streamPlayer = new StreamPlayer(el.video, { onMetadata: restoreSourcePosition });
+const audioPlayer = new StreamPlayer(el.altAudio, { onMetadata: () => {
+  const room = state.room?.state;
+  const target = room ? expectedPosition(room, serverNow()) : el.video.currentTime;
+  if (Math.abs(el.altAudio.currentTime - target) > 0.1) el.altAudio.currentTime = target;
+} });
 
 // ---------------------------------------------------------------------------
 // Small UI helpers
@@ -141,8 +160,9 @@ function sessionId() {
 }
 
 function connect(name) {
+  state.connectionTakenOver = false;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const url = `${proto}://${location.host}/ws?name=${encodeURIComponent(name)}&s=${sessionId()}`;
+  const url = `${proto}://${location.host}/ws?name=${encodeURIComponent(name)}&s=${sessionId()}&buffer=1`;
   setBadge('connecting…');
 
   const ws = new WebSocket(url);
@@ -151,6 +171,7 @@ function connect(name) {
   ws.onopen = () => {
     // A successful open clears the backoff so a long session cannot exhaust it.
     state.retries = 0;
+    state.lastPongAt = performance.now();
     setBadge('syncing clock…');
     startPings();
   };
@@ -169,6 +190,7 @@ function connect(name) {
     stopPings();
     // Another tab took this seat over (same session id): don't fight it.
     if (event.code === 4002) {
+      state.connectionTakenOver = true;
       setBadge('open in another tab', 'ok');
       return;
     }
@@ -228,6 +250,7 @@ function stopPings() {
 
 function onPong(msg) {
   const t3 = performance.now();
+  state.lastPongAt = t3;
   const sample = clockSample(msg.cts, t3, msg.sts);
   if (sample.rtt > 4000) return; // a stalled tab is not a usable sample
   state.samples.push(sample);
@@ -441,27 +464,30 @@ function setPlayIcon(playing) {
  * previous promise is pending aborts it, and a burst of AbortErrors used to
  * leave the room stuck behind the click-to-start overlay forever.
  */
-let playPending = false;
+let playPending = null;
 
 function requestPlay() {
   if (!state.media) {
     toast('Pick an episode from the library first');
     return;
   }
-  if (playPending || !el.video.src) return;
-  playPending = true;
+  if (playPending || !el.video.src || streamPlayer.loading || state.room?.state?.buffering) return;
+  const generation = streamPlayer.generation;
   const attempt = el.video.play();
+  playPending = attempt;
   if (!attempt || typeof attempt.then !== 'function') {
-    playPending = false;
+    playPending = null;
     return;
   }
   attempt
     .then(() => {
-      playPending = false;
+      if (playPending === attempt) playPending = null;
+      if (generation !== streamPlayer.generation) return;
       showGate(false);
     })
     .catch((err) => {
-      playPending = false;
+      if (playPending === attempt) playPending = null;
+      if (generation !== streamPlayer.generation) return;
       // Only a genuine policy block needs a gesture; anything else (a pending
       // seek, a source swap) is transient and retried on the next tick.
       if (err && err.name === 'NotAllowedError') showGate(true);
@@ -479,10 +505,11 @@ function togglePlay() {
   if (playing) return send({ t: 'pause' });
 
   const duration = el.video.duration || state.media.duration || 0;
-  const atEnd = el.video.ended || (duration > 0 && duration - el.video.currentTime < 0.6);
+  const roomPosition = expectedPosition(state.room.state, serverNow());
+  const atEnd = el.video.ended || (duration > 0 && duration - roomPosition < 0.6);
   // Pressing play after the episode finished is a request to watch it again,
   // not to resume the last half-second.
-  send({ t: 'play', position: atEnd ? 0 : el.video.currentTime });
+  send({ t: 'play', position: atEnd ? 0 : roomPosition });
 }
 
 /**
@@ -503,14 +530,118 @@ function seekTo(seconds, { resume = null } = {}) {
  * staring at a black rectangle forever, re-issue load() a couple of times.
  */
 function recoverStalledLoad(now) {
+  if (streamPlayer.loading || streamPlayer.managed) return;
   if (!state.media || !el.video.src || el.video.readyState > 0 || el.video.error) return;
   if (!state.loadStartedAt || now - state.loadStartedAt < 6000) return;
   if (now - state.lastReloadAt < 8000) return;
   state.lastReloadAt = now;
   state.loadStartedAt = now;
   console.warn('media load stalled, retrying');
-  el.video.load();
-  if (state.room?.state?.playing) requestPlay();
+  applyTracks({ force: true });
+}
+
+function bufferAhead(video = el.video, position = video.currentTime) {
+  return bufferedAhead(Array.from({ length: video.buffered.length }, (_,i) => [video.buffered.start(i), video.buffered.end(i)]), position);
+}
+
+function playbackAhead() {
+  return state.altActive ? (audioPlayer.loading ? 0 : Math.min(bufferAhead(), bufferAhead(el.altAudio, el.video.currentTime))) : bufferAhead();
+}
+
+const managedPlayback = () => streamPlayer.managed && (!state.altActive || audioPlayer.managed);
+
+function playbackBufferTarget(room = state.room?.state) {
+  return requiredBuffer({ managed: managedPlayback(), recovering: room?.bufferReason === 'rebuffer',
+    position: room?.position || 0, duration: state.media?.duration || 0 });
+}
+
+function reportPlayback(now = performance.now()) {
+  const room = state.room?.state;
+  if (!room?.mediaId || state.media?.id !== room.mediaId) return;
+  if (room.seq === state.lastPlaybackReportSeq && now - state.lastPlaybackReportAt < BUFFER.REPORT_MS) return;
+  const video = el.video;
+  const loading = streamPlayer.loading || video.readyState < 1 || (state.altActive && audioPlayer.loading);
+  const stalled = loading || video.readyState < 3 || video.seeking ||
+    (state.altActive && el.altAudio.readyState < 3) ||
+    (playbackHealth.waitingSince !== null && now - playbackHealth.waitingSince > 850);
+  if (send({ t: 'playback', mediaId: room.mediaId, seq: room.seq,
+    position: loading ? expectedPosition(room, serverNow()) : video.currentTime,
+    ahead: loading ? 0 : playbackAhead(), managed: managedPlayback(),
+    loading, seeking: video.seeking || (state.altActive && el.altAudio.seeking),
+    decodable: video.readyState >= 3 && !video.error && (!state.altActive || el.altAudio.readyState >= 3),
+    stalled, blocked: state.gateVisible,
+  }, { quiet: true })) {
+    state.lastPlaybackReportAt = now;
+    state.lastPlaybackReportSeq = room.seq;
+  }
+}
+
+const playbackHealth = { source: null, position: 0, progressedAt: 0, waitingSince: null, disconnectedSince: null };
+
+function showPlaybackStatus(kind = '', title = '', detail = '', compact = false) {
+  el.playbackStatus.classList.toggle('hidden', !kind);
+  el.playbackStatus.classList.toggle('compact', compact);
+  if (el.playbackStatus.dataset.kind !== kind) el.playbackStatus.dataset.kind = kind;
+  if (el.playbackStatusTitle.textContent !== title) el.playbackStatusTitle.textContent = title;
+  if (el.playbackStatusDetail.textContent !== detail) el.playbackStatusDetail.textContent = detail;
+}
+
+/** Observe actual playback, including a frozen player that emits no waiting event. */
+function updatePlaybackStatus(now = performance.now()) {
+  const video = el.video;
+  const health = playbackHealth;
+  if (!state.media || !state.sourceUrl) {
+    health.source = null;
+    health.waitingSince = health.disconnectedSince = null;
+    return showPlaybackStatus();
+  }
+  if (health.source !== state.sourceUrl) {
+    health.source = state.sourceUrl;
+    health.position = video.currentTime;
+    health.progressedAt = now;
+    health.waitingSince = null;
+  }
+  if (!video.seeking && video.readyState >= 3 && Math.abs(video.currentTime - health.position) > 0.04) {
+    health.progressedAt = now;
+  }
+  health.position = video.currentTime;
+
+  const room = state.room?.state;
+  const shouldPlay = room?.playing && !room.buffering && !inPreRoll(room, serverNow()) && !state.gateVisible && !video.ended;
+  if (!shouldPlay) health.progressedAt = now;
+  const waiting = shouldPlay && (video.readyState < 3 || video.seeking || now - health.progressedAt > 1400);
+  if (waiting) health.waitingSince ??= now;
+  else health.waitingSince = null;
+
+  const disconnected = state.me && (navigator.onLine === false || state.ws?.readyState !== WebSocket.OPEN || now - state.lastPongAt > 12_000);
+  if (disconnected) health.disconnectedSince ??= now;
+  else health.disconnectedSince = null;
+
+  // Debounce short seeks, source swaps and reconnects; keep the autoplay gate clear.
+  const buffering = health.waitingSince !== null && now - health.waitingSince >= 850;
+  if (health.disconnectedSince !== null && now - health.disconnectedSince >= 850) {
+    if (state.connectionTakenOver) {
+      return showPlaybackStatus('connection', 'Open in another tab', 'Continue watching in the other tab.', true);
+    }
+    return showPlaybackStatus('connection', navigator.onLine === false ? 'You’re offline' : 'Reconnecting…',
+      'Trying to reach the room. Playback will continue when possible.', !buffering);
+  }
+  if (video.error && !state.gateVisible) {
+    return showPlaybackStatus('error', 'Playback interrupted', 'The video could not be loaded.');
+  }
+  if (room?.buffering && !state.gateVisible) {
+    const ahead = playbackAhead();
+    const target = playbackBufferTarget(room);
+    const ready = !streamPlayer.loading && !video.seeking && video.readyState >= 3 && ahead + 0.05 >= target;
+    const waitingFor = state.users.filter((u) => u.id !== state.me?.id && !u.ready).map((u) => u.name).join(', ');
+    return showPlaybackStatus('buffering', ready ? 'Waiting for everyone…' : 'Building a buffer…',
+      ready ? (waitingFor ? `Waiting for ${waitingFor}.` : 'Playback will resume together.') : `${Math.min(target, ahead).toFixed(1)} of ${target.toFixed(0)} seconds ready`);
+  }
+  if (!buffering) return showPlaybackStatus();
+  const lower = (state.media.qualities || []).find((q) => q.height < state.tracks.quality);
+  const prolonged = now - health.waitingSince >= 8000;
+  showPlaybackStatus('buffering', prolonged ? 'Still buffering…' : 'Buffering…',
+    prolonged && lower ? `Try ${lower.height}p if the connection stays slow.` : 'Waiting for video to catch up.');
 }
 
 /**
@@ -519,14 +650,29 @@ function recoverStalledLoad(now) {
  * player is a no-op here.
  */
 function tick() {
+  updatePlaybackStatus();
+  reportPlayback();
   const roomState = state.room?.state;
   if (!roomState || !state.media || !el.video.src) return updateTimeUI();
   recoverStalledLoad(performance.now());
+  if (streamPlayer.loading) {
+    el.altAudio.pause();
+    return updateTimeUI();
+  }
   if (el.video.readyState < 1) return updateTimeUI();
 
   const now = serverNow();
   const position = el.video.currentTime;
   syncAltAudio(roomState, position);
+
+  if (roomState.buffering) {
+    if (!el.video.paused) el.video.pause();
+    if (!el.video.seeking && Math.abs(position - roomState.position) > 0.2) el.video.currentTime = roomState.position;
+    state.nudging = false;
+    setRate(1);
+    setBadge('buffering together…', 'ok');
+    return updateTimeUI();
+  }
 
   if (inPreRoll(roomState, now)) {
     if (!el.video.paused) el.video.pause();
@@ -559,6 +705,14 @@ function tick() {
   // hard-seek into the void and snap back to 0:00. Hold at the last frame.
   const expected = duration ? Math.min(expectedPosition(roomState, now), duration) : expectedPosition(roomState, now);
   const correction = nextCorrection({ currentTime: position, expected, nudging: state.nudging });
+
+  // A slow viewer needs data, not a moving seek target. The server coordinates
+  // a refill; ordinary room seeks and late-join positioning are handled above.
+  if (el.video.readyState < 3 || (correction.action === 'seek' && bufferAhead(el.video, correction.seekTo) < 0.25)) {
+    state.nudging = false;
+    setRate(1);
+    return updateTimeUI();
+  }
 
   switch (correction.action) {
     case 'seek':
@@ -621,17 +775,19 @@ function withRetryParam(url) {
 
 /** Re-attach the current episode after a failed load, a few times at most. */
 function retryPlayback() {
-  if (!state.media) return;
+  if (!state.media || state.retryTimer) return;
+  const generation = streamPlayer.generation;
+  const mediaId = state.media.id;
   state.loadRetries = (state.loadRetries || 0) + 1;
   if (state.loadRetries > 6) {
     toast('That episode could not be rebuilt — check the server log.', 'error');
     return;
   }
   setBadge('rebuilding episode…', 'ok');
-  setTimeout(() => {
-    if (!state.media) return;
-    loadMedia(state.media, { force: true });
-    if (state.room?.state?.playing) requestPlay();
+  state.retryTimer = setTimeout(() => {
+    state.retryTimer = null;
+    if (state.media?.id !== mediaId || streamPlayer.generation !== generation) return;
+    applyTracks({ force: true });
   }, Math.min(5000, 1500 * state.loadRetries));
 }
 
@@ -641,6 +797,12 @@ function retryPlayback() {
  * the player and a generic playback error on screen.
  */
 function clearMedia() {
+  clearTimeout(state.retryTimer);
+  state.retryTimer = null;
+  streamPlayer.destroy();
+  audioPlayer.destroy();
+  state.audioUrl = null;
+  playPending = null;
   state.media = null;
   state.sourceUrl = null;
   state.cleanPending = null;
@@ -656,6 +818,7 @@ function clearMedia() {
   el.video.pause();
   el.video.removeAttribute('src');
   el.video.load();
+  updatePlaybackStatus();
   el.stage.classList.add('empty');
   el.stageTag.classList.add('hidden');
   el.placeholder.classList.remove('hidden');
@@ -855,31 +1018,38 @@ function setSource(url, track, { keepPosition = true, force = false } = {}) {
 
   // A forced load must reload even when the URL is unchanged: that is exactly
   // the "retry the same episode after a rebuild" case.
-  if (!force && state.sourceUrl === url && el.video.src) {
+  if (!force && state.sourceUrl === url && (el.video.src || streamPlayer.loading)) {
     showTextTrack(media, track);
     return;
   }
 
-  const at = keepPosition ? el.video.currentTime || 0 : 0;
-  const wasPlaying = !el.video.paused && !el.video.ended;
-
+  const room = state.room?.state;
+  clearTimeout(state.retryTimer);
+  state.retryTimer = null;
+  if (state.sourceUrl !== url) state.loadRetries = 0;
+  state.sourcePosition = room?.mediaId === media.id ? expectedPosition(room, serverNow())
+    : keepPosition ? (streamPlayer.loading ? state.sourcePosition : el.video.currentTime || 0) : 0;
   state.sourceUrl = url;
-  el.video.pause();
+  state.loadStartedAt = performance.now();
+  state.lastReloadAt = 0;
+  playPending = null;
+  el.altAudio.pause();
   // A forced reload gets a fresh URL: Chrome is happy to reuse the failed
   // response for the same URL, which would make the retry pointless.
-  el.video.src = force ? withRetryParam(url) : url;
   el.video.poster = media.poster || '';
-  el.video.load();
+  streamPlayer.load(force ? withRetryParam(url) : url, { position: state.sourcePosition });
   showTextTrack(media, track);
+}
 
-  el.video.addEventListener(
-    'loadedmetadata',
-    () => {
-      if (keepPosition && at > 0.5) el.video.currentTime = at;
-      if (wasPlaying || state.room?.state?.playing) requestPlay();
-    },
-    { once: true },
-  );
+function restoreSourcePosition() {
+  const room = state.room?.state;
+  if (!state.media) return;
+  const target = room?.mediaId === state.media.id ? expectedPosition(room, serverNow()) : state.sourcePosition;
+  const duration = el.video.duration;
+  const at = Math.max(0, Number.isFinite(duration) && duration > 0 ? Math.min(target, duration - 0.1) : target);
+  if (Math.abs(el.video.currentTime - at) > 0.15) el.video.currentTime = at;
+  state.settleUntil = performance.now() + 400;
+  if (room?.playing && !room.buffering && !inPreRoll(room, serverNow())) requestPlay();
 }
 
 function detachTextTracks() {
@@ -913,6 +1083,8 @@ function applyAudio() {
   const chosen = tracks.find((t) => t.index === state.tracks.audio) || tracks[0];
 
   if (!chosen || chosen.muxed || !chosen.url) {
+    audioPlayer.destroy();
+    state.audioUrl = null;
     el.altAudio.pause();
     el.altAudio.removeAttribute('src');
     state.altActive = false;
@@ -921,25 +1093,28 @@ function applyAudio() {
   }
 
   state.altActive = true;
-  if (el.altAudio.src !== new URL(chosen.url, location.origin).href) {
-    el.altAudio.src = chosen.url;
-    el.altAudio.currentTime = el.video.currentTime || 0;
+  if (state.audioUrl !== chosen.url) {
+    state.audioUrl = chosen.url;
+    const room = state.room?.state;
+    audioPlayer.load(chosen.url, { position: room ? expectedPosition(room, serverNow()) : el.video.currentTime });
   }
   el.altAudio.volume = el.video.volume;
   el.video.muted = true;
-  if (state.room?.state?.playing) el.altAudio.play().catch(() => {});
+  if (state.room?.state?.playing && !state.room.state.buffering && !el.video.paused) el.altAudio.play().catch(() => {});
 }
 
 function syncAltAudio(roomState, position) {
   if (!state.altActive || !el.altAudio.src) return;
   const alt = el.altAudio;
-  if (roomState.playing) {
+  if (audioPlayer.loading) { alt.pause(); return; }
+  if (roomState.playing && !roomState.buffering && !el.video.paused) {
     if (alt.paused && !el.video.paused) alt.play().catch(() => {});
-    if (Math.abs(alt.currentTime - position) > 0.15) alt.currentTime = position;
+    if (Math.abs(alt.currentTime - position) > 0.15 && bufferAhead(alt, position) > 0.1) alt.currentTime = position;
     if (Math.abs(alt.playbackRate - el.video.playbackRate) > 0.001) alt.playbackRate = el.video.playbackRate;
   } else if (!alt.paused) {
     alt.pause();
   }
+  if (roomState.buffering && alt.readyState >= 1 && !alt.seeking && Math.abs(alt.currentTime - position) > 0.15) alt.currentTime = position;
 }
 
 /** Ask the server for the subtitle-free rendition; it is cached afterwards. */
@@ -1223,7 +1398,7 @@ function renderPeople() {
     }
     const status = document.createElement('span');
     status.className = 'state';
-    status.textContent = user.buffering ? 'buffering…' : 'ready';
+    status.textContent = state.room?.state?.buffering && !user.ready ? 'building buffer…' : user.buffering ? 'buffering…' : 'ready';
     li.appendChild(status);
     el.people.appendChild(li);
   }
@@ -2108,18 +2283,6 @@ document.addEventListener('keydown', (event) => {
   }
 });
 
-// A late joiner should never linger at 0:00 waiting for the next tick.
-el.video.addEventListener('loadedmetadata', () => {
-  const roomState = state.room?.state;
-  if (!roomState?.mediaId || !state.media) return;
-  const expected = expectedPosition(roomState, serverNow());
-  if (Math.abs(el.video.currentTime - expected) > 0.5 && !inPreRoll(roomState, serverNow())) {
-    state.settleUntil = performance.now() + 400;
-    el.video.currentTime = expected;
-  }
-  if (roomState.playing) requestPlay();
-});
-
 // The credits roll for everyone: the room should pause, not keep counting.
 el.video.addEventListener('ended', () => {
   if (state.room?.state?.playing) send({ t: 'ended' });
@@ -2135,6 +2298,7 @@ el.video.addEventListener('canplay', () => {
   send({ t: 'buffering', value: false }, { quiet: true });
 });
 el.video.addEventListener('error', () => {
+  if (streamPlayer.managed) return;
   if (!el.video.error) return;
   // The server only answers 409 while it rebuilds a rendition. Waiting for the
   // library event is the right move: retrying on a timer would spend the whole
@@ -2156,7 +2320,8 @@ el.video.addEventListener('play', () => {
   showGate(false);
 });
 el.video.addEventListener('pause', () => {
-  setPlayIcon(false);
+  // During a shared refill, Pause cancels the pending resume; keep that icon.
+  setPlayIcon(Boolean(state.room?.state?.playing));
   el.stage.classList.add('paused');
 });
 
@@ -2182,6 +2347,11 @@ window.__sync = {
     nudging: state.nudging,
     rate: el.video.playbackRate,
     quality: state.tracks?.quality ?? null,
+    sourceUrl: state.sourceUrl,
+    buffering: Boolean(state.room?.state?.buffering),
+    bufferedAhead: Number(playbackAhead().toFixed(2)),
+    managedBuffer: managedPlayback(),
+    sourceLoading: streamPlayer.loading,
     subtitles: !state.media
       ? 'none'
       : state.tracks.sub === 'styled'

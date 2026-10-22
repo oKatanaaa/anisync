@@ -31,7 +31,7 @@ const makeEpisode = (name) => {
 
 test('a silent child is killed by the stall watchdog', async () => {
   const started = Date.now();
-  const result = await run('sleep', ['30'], { stallMs: 400 });
+  const result = await run(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stallMs: 400 });
   const elapsed = Date.now() - started;
 
   assert.match(result.stderr, /no output for/);
@@ -41,13 +41,13 @@ test('a silent child is killed by the stall watchdog', async () => {
 });
 
 test('a run-away child is stopped by the time limit', async () => {
-  const result = await run('sleep', ['30'], { maxRuntimeMs: 500 });
+  const result = await run(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { maxRuntimeMs: 500 });
   assert.match(result.stderr, /time limit/);
   assert.notEqual(result.code, 0);
 });
 
 test('shutdown kills whatever is still running', async () => {
-  const pending = run('sleep', ['30']);
+  const pending = run(process.execPath, ['-e', 'setTimeout(() => {}, 30000)']);
   await new Promise((resolve) => setTimeout(resolve, 300));
   assert.equal(runningChildren(), 1);
 

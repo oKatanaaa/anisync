@@ -51,4 +51,8 @@ export const config = {
     .map((value) => Number(value.trim()))
     .filter((value) => Number.isFinite(value) && value > 0),
   crf: num(process.env.CRF, 21),
+  /** Spend more time preparing once to reduce bandwidth throughout playback. */
+  x264Preset: process.env.X264_PRESET || 'medium',
+  /** 1080p video ceiling, scaled down for smaller renditions. 0 restores uncapped encoding/remuxing. */
+  maxVideoKbps: Math.max(0, num(process.env.MAX_VIDEO_KBPS, 3500)),
 };

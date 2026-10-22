@@ -11,6 +11,7 @@ import { config } from './config.js';
 import { Library, isMediaId } from './media.js';
 import { Room } from './rooms.js';
 import { detectEncoder, killAll, runningChildren } from './ffmpeg.js';
+import { HlsCache, isRendition, isHlsAsset } from './hls.js';
 
 const log = (...args) => console.log(new Date().toISOString(), ...args);
 
@@ -75,6 +76,7 @@ const room = new Room({
     if (type === 'lock') broadcast({ t: 'lock', locked: payload.locked });
   },
 });
+const hlsCache = new HlsCache(config.cacheDir);
 
 /**
  * The room's episode survives a restart.
@@ -140,7 +142,10 @@ app.disable('x-powered-by');
 app.use(express.json({ limit: '64kb' }));
 
 app.use('/shared', express.static(path.join(config.root, 'shared'), { maxAge: '1h' }));
-app.use(express.static(path.join(config.root, 'public'), { maxAge: '5m', index: 'index.html' }));
+app.get('/vendor/hls.mjs', (_req, res) => res.sendFile(path.join(config.root, 'node_modules/hls.js/dist/hls.min.mjs'), { maxAge: '1h' }));
+app.use(express.static(path.join(config.root, 'public'), { maxAge: '5m', index: 'index.html',
+  setHeaders: (res, file) => { if (file.endsWith('.html')) res.set('Cache-Control', 'no-cache'); },
+}));
 
 app.get('/api/health', async (_req, res) => {
   res.json({
@@ -201,7 +206,7 @@ app.delete('/api/media/:id', async (req, res, next) => {
     const item = library.get(id);
     if (!item) return res.status(404).json({ error: 'not in the library' });
     // Deleting mid-encode would pull the cache directory out from under ffmpeg.
-    if (item.preparing) return res.status(409).json({ error: 'still preparing — try again when it finishes' });
+    if (item.preparing || [...hlsCache.inflight.keys()].some((key) => key.startsWith(`${id}:`))) return res.status(409).json({ error: 'still preparing — try again when it finishes' });
 
     const removed = await library.remove(id);
     if (!removed) return res.status(404).json({ error: 'not in the library' });
@@ -339,6 +344,30 @@ app.post('/api/upload', (req, res) => {
 });
 
 // --- media byte ranges ------------------------------------------------------
+// The original MP4 remains a fallback; HLS provides controlled forward buffering.
+app.get('/api/media/:id/stream', async (req, res) => {
+  const { id } = req.params;
+  const file = req.query.file;
+  if (!isMediaId(id) || !isRendition(file)) return res.status(400).json({ error: 'Invalid rendition' });
+  if (!library.get(id)) return res.status(404).json({ error: 'Unknown media' });
+  try {
+    res.set('Cache-Control', 'no-store').json(await hlsCache.ensure(id, file));
+  } catch (err) {
+    log(`HLS preparation failed for ${id}: ${err.message}`);
+    res.status(err.code === 'ENOENT' ? 409 : 503).json({ error: 'Segmented playback unavailable' });
+  }
+});
+
+app.get('/media/:id/hls/:token/:file', (req, res) => {
+  const { id, token, file } = req.params;
+  if (!isMediaId(id) || !/^[0-9a-f]{20}$/.test(token) || !isHlsAsset(file)) return res.status(400).end();
+  if (!library.get(id)) return res.status(404).end();
+  res.sendFile(path.join(config.cacheDir, id, 'hls', token, file), {
+    headers: { 'Cache-Control': 'private, max-age=31536000, immutable',
+      'Content-Type': file.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp4' },
+    cacheControl: false,
+  });
+});
 // res.sendFile implements conditional GET and Range requests, which is what
 // makes instant seeking work without any streaming server.
 
@@ -500,7 +529,8 @@ wss.on('connection', (ws, url) => {
     return ws.close(4001, 'room full');
   }
 
-  const user = { id: crypto.randomUUID().slice(0, 8), name: cleanName(url.searchParams.get('name')) };
+  const user = { id: crypto.randomUUID().slice(0, 8), name: cleanName(url.searchParams.get('name')),
+    bufferSync: url.searchParams.get('buffer') === '1' };
   clients.set(ws, { user, alive: true, sessionKey });
 
   const joined = room.join(user);
@@ -615,7 +645,7 @@ const heartbeat = setInterval(() => {
 // once it has been quiet for a while, so nobody rejoins a stale timeline.
 const sweeper = setInterval(() => {
   if (room.sweep()) log('room rewound after being empty');
-}, 15_000);
+}, 1000);
 
 // ---------------------------------------------------------------------------
 // Boot

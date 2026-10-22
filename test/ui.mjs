@@ -491,8 +491,8 @@ await scenario('host leaves and hands over', async () => {
 });
 
 await scenario('end of episode', async () => {
-  const a = await join(await newPage(), 'Pia');
-  const b = await join(await newPage(), 'Quin');
+  const a = await newSoloPage('Pia');
+  const b = await newSoloPage('Quin');
   await openEpisode(a);
 
   const duration = await a.evaluate(() => document.getElementById('video').duration);
@@ -1044,7 +1044,7 @@ await scenario('switchable audio and subtitle tracks', async () => {
   });
   check(
     'choosing a soft track switches to the subtitle-free rendition',
-    await waitFor(a, () => document.getElementById('video').currentSrc.includes('video.clean.mp4'), 90000, 'clean rendition'),
+    await waitFor(a, () => (window.__sync.snapshot().sourceUrl || '').includes('video.clean.mp4'), 90000, 'clean rendition'),
     '',
     a,
   );
@@ -1059,7 +1059,7 @@ await scenario('switchable audio and subtitle tracks', async () => {
   );
   check(
     'the other viewer still has burned-in subtitles',
-    await b.evaluate(() => document.getElementById('video').textTracks.length === 0 && !document.getElementById('video').currentSrc.includes('clean')),
+    await b.evaluate(() => document.getElementById('video').textTracks.length === 0 && !(window.__sync.snapshot().sourceUrl || '').includes('clean')),
     '',
     b,
   );
@@ -1077,7 +1077,7 @@ await scenario('switchable audio and subtitle tracks', async () => {
   await sleep(2500);
   check('a reload is not mistaken for a fourth viewer', (await snap(a)).users === 2, `${(await snap(a)).users} viewers`, a);
   const remembered = await a.evaluate(() => ({
-    src: document.getElementById('video').currentSrc,
+    src: (window.__sync.snapshot().sourceUrl || ''),
     tracks: document.getElementById('video').textTracks.length,
     alt: document.getElementById('altAudio').src,
   }));
@@ -1100,7 +1100,7 @@ await scenario('switchable audio and subtitle tracks', async () => {
   const offState = await a.evaluate(() => ({
     sub: window.__sync.snapshot().subtitles,
     empty: document.getElementById('stage').classList.contains('empty'),
-    src: document.getElementById('video').currentSrc.split('/').pop(),
+    src: (window.__sync.snapshot().sourceUrl || '').split('/').pop(),
     toast: [...document.querySelectorAll('#toasts .toast')].map((t) => t.textContent).join(' | '),
   }));
   check('the state reports no subtitles', offState.sub === 'off', JSON.stringify(offState), a);
@@ -1407,7 +1407,7 @@ await scenario('switching to a lighter rendition', async () => {
   const NAME = 'Ladder Episode - 01.mkv';
   const file = path.join(root, 'media', NAME);
   execSync(
-    `ffmpeg -y -v error -f lavfi -i testsrc2=size=1920x1080:rate=12 -f lavfi -i sine=frequency=440 -t 8 ` +
+    `ffmpeg -y -v error -f lavfi -i testsrc2=size=1920x1080:rate=12 -f lavfi -i sine=frequency=440 -t 24 ` +
       `-c:v libx264 -preset ultrafast -crf 26 -pix_fmt yuv420p -c:a aac "${file}"`,
     { stdio: 'ignore' },
   );
@@ -1419,8 +1419,8 @@ await scenario('switching to a lighter rendition', async () => {
     await fetch(`${BASE}/api/rescan`, { method: 'POST' });
   });
 
-  const a = await join(await newPage(), 'Sol');
-  const b = await join(await newPage(), 'Tam');
+  const a = await newSoloPage('Sol');
+  const b = await newSoloPage('Tam');
   await click(a, '.tab[data-tab=library]');
   await click(a, '#rescanBtn');
   await sleep(1200);
@@ -1461,6 +1461,11 @@ await scenario('switching to a lighter rendition', async () => {
   await openEpisode(a, 'Ladder Episode');
   await click(a, '#playBtn');
   await sleep(2000);
+  await seekTo(a, 12);
+  await waitFor(a, () => !window.__sync.snapshot().buffering && document.getElementById('video').currentTime >= 12, 20000, 'mid-episode playback');
+  await click(a, '#playBtn');
+  await waitFor(a, () => !window.__sync.snapshot().playing, 5000, 'paused midpoint');
+  await waitFor(b, () => !window.__sync.snapshot().playing, 5000, 'other viewer paused');
 
   const pill = await a.evaluate(() => ({
     hidden: document.getElementById('qualityBtn').classList.contains('hidden'),
@@ -1481,36 +1486,38 @@ await scenario('switching to a lighter rendition', async () => {
   check('the sharp one is active to begin with', menu.items[0]?.active && menu.items[0]?.name === '1080p', JSON.stringify(menu.items), a);
 
   const before = await a.evaluate(() => ({
-    src: document.getElementById('video').currentSrc,
+    src: (window.__sync.snapshot().sourceUrl || ''),
     at: document.getElementById('video').currentTime,
   }));
   await a.evaluate(() => {
     [...document.querySelectorAll('#qualityList .track-item')].find((n) => n.querySelector('.track-name').textContent === '720p').click();
   });
-  const switched = await waitFor(a, () => document.getElementById('video').currentSrc.includes('/quality/720/'), 20000, '720p source');
+  const switched = await waitFor(a, () => !window.__sync.snapshot().sourceLoading && document.getElementById('video').videoHeight === 720 && document.getElementById('video').readyState >= 3, 20000, 'decoded 720p source');
   const after = await a.evaluate(() => ({
-    src: document.getElementById('video').currentSrc,
+    src: (window.__sync.snapshot().sourceUrl || ''),
     at: document.getElementById('video').currentTime,
     quality: window.__sync.snapshot().quality,
     label: document.getElementById('qualityLabel').textContent,
     meta: document.getElementById('nowSub').textContent,
   }));
   check('picking 720p switches the stream without a reload', switched, after.src.split('/').slice(-2).join('/'), a);
-  check('the position survives the switch', Math.abs(after.at - before.at) < 6, `${before.at.toFixed(1)}s → ${after.at.toFixed(1)}s`, a);
+  check('the position survives the switch', before.at > 10 && Math.abs(after.at - before.at) < 0.3, `${before.at.toFixed(1)}s → ${after.at.toFixed(1)}s`, a);
   check('the control shows the chosen quality', after.quality === 720 && after.label === '720p', `${after.quality} / ${after.label}`, a);
   check('the stage says what is being streamed', /720p/.test(after.meta), after.meta, a);
-  check('another viewer keeps the sharp stream', await b.evaluate(() => !document.getElementById('video').currentSrc.includes('/quality/720/')), '', b);
+  check('another viewer keeps the sharp stream', await b.evaluate(() => !(window.__sync.snapshot().sourceUrl || '').includes('/quality/720/')), '', b);
+  check('another viewer stays at the same position', Math.abs(await pos(b) - before.at) < 0.3, '', b);
 
   await click(a, '#qualityBtn');
   await a.evaluate(() => {
     [...document.querySelectorAll('#qualityList .track-item')].find((n) => n.querySelector('.track-name').textContent === '1080p').click();
   });
   check(
-    'switching back to 1080p is instant',
-    await waitFor(a, () => !document.getElementById('video').currentSrc.includes('/quality/720/'), 15000, 'back to 1080p'),
+    'switching back decodes 1080p at the same position',
+    await waitFor(a, () => !window.__sync.snapshot().sourceLoading && document.getElementById('video').videoHeight === 1080 && document.getElementById('video').readyState >= 3, 15000, 'decoded 1080p'),
     '',
     a,
   );
+  check('the return to 1080p never rewinds to zero', Math.abs(await pos(a) - before.at) < 0.3, '', a);
 
   // One card, not two: the copy must never appear as a separate library entry.
   const cards = await a.evaluate(() => [...document.querySelectorAll('#library .card')].filter((n) => n.textContent.includes('Ladder Episode')).length);

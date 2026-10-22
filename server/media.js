@@ -3,7 +3,7 @@ import fss from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { config } from './config.js';
-import { run, ffprobeJson, detectEncoder, encoderArgs, parseProgress } from './ffmpeg.js';
+import { run, ffprobeJson, detectEncoder, encoderArgs, parseProgress, videoRateLimit } from './ffmpeg.js';
 import { assToVtt } from './assToVtt.js';
 import { findSidecars } from './sidecars.js';
 
@@ -503,7 +503,8 @@ export class Library {
       ladder.push({
         height,
         url: kinds.includes('styled') ? `/media/${item.id}/quality/${height}/video.mp4?v=${version}` : null,
-        cleanUrl: kinds.includes('clean') ? `/media/${item.id}/quality/${height}/clean.mp4?v=${version}` : null,
+        cleanUrl: kinds.includes('clean') ? `/media/${item.id}/quality/${height}/clean.mp4?v=${version}`
+          : !item.bakedSubs && kinds.includes('styled') ? `/media/${item.id}/quality/${height}/video.mp4?v=${version}` : null,
         // The styled copy is what the menu checks before switching.
         ready: kinds.includes('styled'),
       });
@@ -805,6 +806,7 @@ export class Library {
             stamp: `${item.size}:${item.mtimeMs}`,
             preparedAt: new Date().toISOString(),
             encoder,
+            encoding: { crf: config.crf, preset: config.x264Preset, maxVideoKbps: config.maxVideoKbps },
             bakedSubs: Boolean(bakeSub),
             variants: { clean: false },
             audios: (item.audios || []).map(({ index, label, lang, channels, missing }) => ({ index, label, lang, channels, missing: Boolean(missing) })),
@@ -840,6 +842,7 @@ export class Library {
     // A lower-resolution variant scales to that height; the main rendition caps
     // at config.maxHeight.
     const targetHeight = height || config.maxHeight;
+    const maxrateKbps = videoRateLimit(Math.min(item.height || targetHeight, targetHeight), config.maxVideoKbps);
     const args = ['-hide_banner', '-nostdin', '-y', '-i', item.path];
 
     // The default audio track is normally inside the container, but a silent
@@ -857,6 +860,7 @@ export class Library {
     // frame size is something we are willing to stream: a 4K H.264 file would
     // otherwise be remuxed untouched and choke a weak client.
     const copyable =
+      maxrateKbps === 0 &&
       !bakeSub &&
       !item.hdr &&
       item.videoCodec === 'h264' &&
@@ -882,7 +886,7 @@ export class Library {
       // Typesetting, signs and karaoke only survive if libass draws them.
       // Paths are relative to the cache dir (see .cwd) so no filter escaping.
       if (bakeSub) filters.push(`subtitles=filename=subs/${bakeSub.file}:fontsdir=fonts`);
-      args.push(...encoderArgs(encoder, { crf: config.crf }));
+      args.push(...encoderArgs(encoder, { crf: config.crf, preset: config.x264Preset, maxrateKbps }));
       // A keyframe every two seconds (time-based, so it does not depend on the
       // source fps) is what makes clicking the scrub bar feel instant.
       args.push('-pix_fmt', 'yuv420p', '-sc_threshold', '0', '-force_key_frames', 'expr:gte(t,n_forced*2)');

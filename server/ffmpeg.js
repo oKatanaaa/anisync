@@ -131,14 +131,22 @@ export function detectEncoder(preference = 'auto') {
   return encoderPromise;
 }
 
-export function encoderArgs(encoder, { crf }) {
+export function videoRateLimit(height, maximumKbps) {
+  if (!(maximumKbps > 0)) return 0;
+  return Math.max(200, Math.round(maximumKbps * (Math.min(1080, height || 1080) / 1080) ** 1.5));
+}
+
+export function encoderArgs(encoder, { crf, preset = 'medium', maxrateKbps = 0 }) {
+  const limit = maxrateKbps > 0 ? ['-maxrate', `${maxrateKbps}k`, '-bufsize', `${maxrateKbps * 2}k`] : [];
   if (encoder === 'nvenc') {
-    return ['-c:v', 'h264_nvenc', '-preset', 'p4', '-tune', 'hq', '-rc', 'vbr', '-cq', String(crf), '-b:v', '0'];
+    return ['-c:v', 'h264_nvenc', '-preset', 'p4', '-tune', 'hq', '-rc', 'vbr', '-cq', String(crf), '-b:v', '0', ...limit];
   }
   if (encoder === 'vaapi') {
-    return ['-c:v', 'h264_vaapi', '-qp', String(crf)];
+    return maxrateKbps > 0
+      ? ['-c:v', 'h264_vaapi', '-rc_mode', 'VBR', '-b:v', `${Math.round(maxrateKbps * 0.8)}k`, ...limit]
+      : ['-c:v', 'h264_vaapi', '-qp', String(crf)];
   }
-  return ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', String(crf), '-profile:v', 'high'];
+  return ['-c:v', 'libx264', '-preset', preset, '-crf', String(crf), '-profile:v', 'high', ...limit];
 }
 
 /**

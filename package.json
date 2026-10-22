@@ -10,6 +10,7 @@
     "test": "node --test test/*.test.js",
     "start": "node server/index.js",
     "test:ui": "node test/ui.mjs",
+    "test:playback": "node test/playback-ui.mjs",
     "test:unit": "node --test test/*.test.js"
   },
   "keywords": [],
@@ -20,6 +21,7 @@
   "dependencies": {
     "busboy": "^1.6.0",
     "express": "^4.22.3",
+    "hls.js": "1.7.3",
     "ws": "^8.22.0"
   },
   "devDependencies": {

@@ -1,4 +1,5 @@
 import { expectedPosition } from '../shared/sync.js';
+import { BUFFER, requiredBuffer } from '../shared/playback.js';
 
 const RATE_VALUES = new Set([0.75, 1, 1.25, 1.5]);
 
@@ -32,6 +33,8 @@ export class Room {
     this.state = {
       seq: 0,
       playing: false,
+      buffering: false,
+      bufferReason: null,
       position: 0,
       anchor: this.now(),
       rate: 1,
@@ -73,13 +76,15 @@ export class Room {
       isHost: u.isHost,
       buffering: u.buffering,
       latency: u.latency,
+      ready: Boolean(u.ready),
+      bufferedAhead: u.playback?.ahead ?? 0,
     }));
   }
 
   join(user) {
     if (this.full) return { ok: false, error: 'full' };
     const isFirst = this.users.size === 0;
-    const record = { ...user, isHost: isFirst, buffering: false, latency: null, joinedAt: this.now(), ready: false };
+    const record = { ...user, isHost: isFirst, buffering: false, latency: null, joinedAt: this.now(), ready: false, playback: null, stalledSince: null };
     this.users.set(record.id, record);
     this.emptySince = null;
     this.system(`${record.name} joined`);
@@ -105,10 +110,11 @@ export class Room {
       // credits. Freeze it where it was; the sweep rewinds it later.
       this.emptySince = this.now();
       if (this.state.playing) {
-        this.#commit({ playing: false, position: this.expected(this.now()), anchor: this.now(), rate: 1 }, null);
+        this.#commit({ playing: false, buffering: false, bufferReason: null, position: this.expected(this.now()), anchor: this.now(), rate: 1 }, null);
       }
     }
     this.onEvent('users', this.usersPayload());
+    this.#resumeWhenReady();
   }
 
   /**
@@ -145,6 +151,8 @@ export class Room {
       seq: this.state.seq + 1,
       mediaId: saved.mediaId,
       playing: false,
+      buffering: false,
+      bufferReason: null,
       position,
       anchor: this.now(),
       rate: 1,
@@ -163,6 +171,7 @@ export class Room {
    * overnight starts clean for the next person.
    */
   sweep(now = this.now()) {
+    this.#resumeWhenReady(now);
     if (this.users.size > 0) {
       this.emptySince = null;
       return false;
@@ -173,7 +182,7 @@ export class Room {
     }
     if (now - this.emptySince < this.idleResetMs) return false;
     if (!this.state.playing && this.state.position === 0) return false;
-    this.#commit({ playing: false, position: 0, anchor: now, rate: 1 }, null);
+    this.#commit({ playing: false, buffering: false, bufferReason: null, position: 0, anchor: now, rate: 1 }, null);
     return true;
   }
 
@@ -185,7 +194,7 @@ export class Room {
   forgetMedia() {
     if (!this.media && !this.state.mediaId) return false;
     this.media = null;
-    this.#commit({ playing: false, position: 0, anchor: this.now(), rate: 1, mediaId: null }, null);
+    this.#commit({ playing: false, buffering: false, bufferReason: null, position: 0, anchor: this.now(), rate: 1, mediaId: null }, null);
     this.system('That episode is no longer in the library');
     return true;
   }
@@ -219,6 +228,63 @@ export class Room {
     this.onEvent('state', { ...this.state });
   }
 
+  #participants(now = this.now()) {
+    return [...this.users.values()].filter((u) => u.bufferSync &&
+      !(u.playback?.blocked) && now - (u.playback?.at ?? u.joinedAt) < BUFFER.REPORT_TTL_MS);
+  }
+
+  #start(position, user, reason, delay) {
+    const buffering = this.#participants().length > 0;
+    for (const u of this.users.values()) { u.ready = false; u.stalledSince = null; }
+    this.#commit({ playing: true, buffering, bufferReason: buffering ? reason : null,
+      position, anchor: this.now() + (buffering ? 0 : delay), rate: this.state.rate || 1 }, user);
+  }
+
+  #isReady(user) {
+    const p = user.playback;
+    if (!p || p.seq !== this.state.seq || p.loading || p.seeking || !p.decodable) return false;
+    const target = this.state.position;
+    const ahead = p.position + p.ahead - target;
+    return Math.abs(p.position - target) <= 0.35 && ahead + 0.05 >= requiredBuffer({
+      managed: p.managed, recovering: this.state.bufferReason === 'rebuffer',
+      position: target, duration: this.media?.duration || 0,
+    });
+  }
+
+  #resumeWhenReady(now = this.now()) {
+    if (!this.state.playing || !this.state.buffering) return;
+    const participants = this.#participants(now);
+    if (!participants.every((u) => this.#isReady(u))) return;
+    for (const u of participants) u.stalledSince = null;
+    this.#commit({ buffering: false, bufferReason: null, anchor: now + this.startDelayMs }, null);
+  }
+
+  #playback(actor, msg, now) {
+    // Old source loads, prior seeks and stale sockets cannot release a new hold.
+    if (!this.users.has(actor?.id) || msg.mediaId !== this.state.mediaId || msg.seq !== this.state.seq) return { ok: true };
+    if (!Number.isFinite(msg.position) || msg.position < 0 || !Number.isFinite(msg.ahead) || msg.ahead < 0) return { ok: false, error: 'Invalid playback report' };
+    actor.playback = { seq: msg.seq, at: now, position: msg.position, ahead: Math.min(msg.ahead, 86400),
+      managed: Boolean(msg.managed), loading: Boolean(msg.loading), seeking: Boolean(msg.seeking),
+      decodable: Boolean(msg.decodable), blocked: Boolean(msg.blocked) };
+    actor.buffering = Boolean(msg.stalled);
+    actor.ready = this.state.buffering ? this.#isReady(actor) : !actor.buffering;
+    if (this.state.playing && !this.state.buffering && now >= this.state.anchor && !msg.blocked) {
+      if (msg.stalled) actor.stalledSince ??= now;
+      else actor.stalledSince = null;
+      if (actor.bufferSync && actor.stalledSince !== null && now - actor.stalledSince >= BUFFER.STALL_GRACE_MS) {
+        const expected = this.expected(now);
+        // A real stall may rewind others slightly to preserve the missed line.
+        // A loading source at 00:00 must never rewind an episode mid-way.
+        const position = !msg.loading && !msg.seeking && msg.position >= expected - 2 && msg.position <= expected
+          ? msg.position : expected;
+        this.#start(position, null, 'rebuffer', 0);
+      }
+    }
+    this.onEvent('users', this.usersPayload());
+    this.#resumeWhenReady(now);
+    return { ok: true };
+  }
+
   /** Returns { ok, error } — errors are shown to the client, not thrown. */
   apply(user, msg) {
     const now = this.now();
@@ -240,14 +306,14 @@ export class Room {
         if (guarded) return { ok: false, error: 'Only the host can control playback right now' };
         if (!this.state.mediaId) return { ok: false, error: 'No media loaded' };
         const pos = clampPos(msg.position ?? this.expected(now));
-        this.#commit({ playing: true, position: pos, anchor: now + this.startDelayMs, rate: this.state.rate || 1 }, actor);
+        this.#start(pos, actor, 'start', this.startDelayMs);
         return { ok: true };
       }
 
       case 'pause': {
         if (guarded) return { ok: false, error: 'Only the host can control playback right now' };
         const pos = this.expected(now);
-        this.#commit({ playing: false, position: pos, anchor: now, rate: 1 }, actor);
+        this.#commit({ playing: false, buffering: false, bufferReason: null, position: pos, anchor: now, rate: 1 }, actor);
         return { ok: true };
       }
 
@@ -255,10 +321,8 @@ export class Room {
         if (guarded) return { ok: false, error: 'Only the host can control playback right now' };
         const pos = clampPos(msg.position);
         const playing = Boolean(msg.resume ?? this.state.playing);
-        this.#commit(
-          { playing, position: pos, anchor: now + (playing ? this.seekDelayMs : 0), rate: playing ? this.state.rate || 1 : 1 },
-          actor,
-        );
+        if (playing) this.#start(pos, actor, 'seek', this.seekDelayMs);
+        else this.#commit({ playing: false, buffering: false, bufferReason: null, position: pos, anchor: now, rate: 1 }, actor);
         return { ok: true };
       }
 
@@ -275,7 +339,7 @@ export class Room {
         if (guarded) return { ok: false, error: 'Only the host can load media right now' };
         if (!msg.mediaId) return { ok: false, error: 'Missing mediaId' };
         this.media = { id: msg.mediaId, title: msg.title || 'Untitled', duration: Number(msg.duration) || 0 };
-        this.#commit({ playing: false, position: 0, anchor: now, rate: 1, mediaId: msg.mediaId }, actor);
+        this.#commit({ playing: false, buffering: false, bufferReason: null, position: 0, anchor: now, rate: 1, mediaId: msg.mediaId }, actor);
         this.system(`${actor?.name ?? 'someone'} loaded ${this.media.title}`);
         return { ok: true };
       }
@@ -291,9 +355,9 @@ export class Room {
       // The episode reached its last frame on some player. Stop the room at the
       // credits instead of letting the anchor run past the duration forever.
       case 'ended': {
-        if (!this.state.playing) return { ok: true };
+        if (!this.state.playing || this.state.buffering) return { ok: true };
         const duration = this.media?.duration || this.state.position;
-        this.#commit({ playing: false, position: duration, anchor: now, rate: 1 }, actor);
+        this.#commit({ playing: false, buffering: false, bufferReason: null, position: duration, anchor: now, rate: 1 }, actor);
         return { ok: true };
       }
 
@@ -302,6 +366,9 @@ export class Room {
         this.onEvent('users', this.usersPayload());
         return { ok: true };
       }
+
+      case 'playback':
+        return this.#playback(actor, msg, now);
 
       case 'latency': {
         if (actor) actor.latency = Number(msg.value) || null;
