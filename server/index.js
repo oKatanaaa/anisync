@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import http from 'node:http';
 import express from 'express';
-import busboy from 'busboy';
+import { receiveUpload } from './upload.js';
 import { WebSocketServer } from 'ws';
 
 import { config } from './config.js';
@@ -222,111 +222,17 @@ app.delete('/api/media/:id', async (req, res, next) => {
   }
 });
 
-app.post('/api/upload', (req, res) => {
-  let bus;
-  try {
-    bus = busboy({ headers: req.headers, limits: { files: 1, fileSize: config.maxUploadBytes } });
-  } catch {
-    return res.status(400).json({ error: 'expected multipart upload' });
-  }
-
-  let savedPath = null;
-  let tooBig = false;
-  let failure = null;
-  let writeDone = null; // resolves when the temp file is flushed and renamed
-  let tempPath = null;
-  // A socket that dies mid-upload leaves a temp file behind; drop it at once
-  // rather than waiting for the next scan to sweep it.
-  const dropTemp = () => {
-    if (!tempPath) return;
-    library.activeUploads.delete(path.basename(tempPath));
-    fs.rm(tempPath, { force: true }, () => {});
-    tempPath = null;
-  };
-
+app.post('/api/upload', async (req, res, next) => {
   const startedAt = Date.now();
-  let received = 0;
-  bus.on('file', (_field, file, info) => {
-    const safe = path.basename(info.filename).replace(/[^\w.\- ()[\]]+/g, '_').slice(0, 180);
-    // Videos become library items; subtitle and audio sidecars are accepted so
-    // an episode's tracks can be uploaded next to it and picked up by the scan.
-    if (!/\.(mkv|mp4|webm|avi|mov|m4v|ts|m2ts|m4a|aac|opus|flac|mp3|ogg|wav|ass|ssa|srt|vtt)$/i.test(safe)) {
-      failure = 'unsupported file type';
-      file.resume();
-      return;
-    }
-    // Write beside the target and rename when the upload completes: a dropped
-    // connection must never leave a truncated file that looks like an episode.
-    const dest = path.join(config.mediaDir, safe);
-    const temp = `${dest}.part`;
-    tempPath = temp;
-    savedPath = dest;
-    // Tell the scanner this .part file is a live transfer, not crash debris.
-    library.activeUploads.add(path.basename(temp));
-    const out = fs.createWriteStream(temp);
-    file.on('data', (chunk) => {
-      received += chunk.length;
+  try {
+    const { savedPath, received } = await receiveUpload(req, {
+      mediaDir: config.mediaDir,
+      maxUploadBytes: config.maxUploadBytes,
+      activeUploads: library.activeUploads,
     });
-    file.pipe(out);
-    out.on('error', (err) => {
-      failure = failure || `write failed: ${err.message}`;
-    });
-    file.on('limit', () => {
-      tooBig = true;
-      out.destroy();
-      fs.rm(temp, { force: true }, () => {});
-    });
-    file.on('error', () => {
-      out.destroy();
-      fs.rm(temp, { force: true }, () => {});
-    });
-    writeDone = new Promise((resolve) => {
-      out.on('close', () => {
-        // Whether it succeeded or not, this transfer no longer owns the file.
-        library.activeUploads.delete(path.basename(temp));
-        if (tooBig || failure) return resolve();
-        try {
-          fs.renameSync(temp, dest);
-        } catch (err) {
-          failure = `could not save upload: ${err.message}`;
-          fs.rm(temp, { force: true }, () => {});
-        }
-        resolve();
-      });
-    });
-  });
-
-  req.on('aborted', () => {
-    tooBig = false;
-    failure = failure || 'upload aborted';
-    dropTemp();
-  });
-  // Node 22 reports a dead upload as 'close' with an incomplete request rather
-  // than 'aborted'; both paths have to be covered.
-  req.on('close', () => {
-    if (req.complete) return;
-    failure = failure || 'upload aborted';
-    dropTemp();
-  });
-
-  bus.on('close', async () => {
-    // busboy finishes parsing before the last chunk is flushed to disk.
-    if (writeDone) await writeDone.catch(() => {});
-    if (failure) {
-      const seconds = Math.max(0.1, (Date.now() - startedAt) / 1000);
-      log(
-        `upload rejected after ${seconds.toFixed(0)}s: ${failure} ` +
-          `(${(received / 1024 / 1024).toFixed(1)} MB, ${(received / 1024 / 1024 / seconds).toFixed(1)} MB/s)`,
-      );
-      return res.status(400).json({ error: failure });
-    }
-    if (tooBig) {
-      log('upload rejected: file too large');
-      return res.status(413).json({ error: 'file too large' });
-    }
-    if (!savedPath || !fs.existsSync(savedPath)) {
-      return res.status(400).json({ error: 'no file received' });
-    }
+    // A scan already probing files took its directory snapshot before this
+    // upload landed. Finish it, then scan again so the new episode is included.
+    if (library.scanning) await library.scanning;
     await library.scan();
     pruneRoomMedia();
     const item = [...library.items.values()].find((i) => i.path === savedPath);
@@ -338,9 +244,11 @@ app.post('/api/upload', (req, res) => {
     if (item) library.prepare(item.id).catch(() => {});
     broadcast({ t: 'library' });
     res.json({ ok: true, id: item?.id ?? null });
-  });
-
-  req.pipe(bus);
+  } catch (err) {
+    if (!err.status) return next(err);
+    log(`upload rejected: ${err.message}`);
+    if (!res.destroyed) res.status(err.status).json({ error: err.message });
+  }
 });
 
 // --- media byte ranges ------------------------------------------------------

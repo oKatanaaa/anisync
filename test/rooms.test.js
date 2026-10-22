@@ -294,7 +294,7 @@ test('winding an episode off the end pauses the room', () => {
   t.join('a');
   t.load(90);
   t.room.apply(t.room.host(), { t: 'play', position: 0 });
-  t.tick(89_000);
+  t.tick(91_000); // 1 second of pre-roll plus the 90-second episode
   const res = t.room.apply(t.room.host(), { t: 'ended' });
   assert.equal(res.ok, true);
   assert.equal(t.room.state.playing, false);
@@ -310,7 +310,24 @@ test('a late ended message cannot rewind a replay', () => {
   t.room.apply(t.room.host(), { t: 'ended' });
   t.room.apply(t.room.host(), { t: 'play', position: 0 });
   t.room.apply(t.room.host(), { t: 'ended' });
-  assert.equal(t.room.state.playing, false);
+  assert.equal(t.room.state.playing, true, 'a delayed ended event must not stop the replay');
+  assert.equal(t.room.state.position, 0);
+});
+
+test('ended events from a previous seek or episode cannot stop the current episode', () => {
+  const t = makeRoom();
+  const user = t.join('a');
+  t.load(90);
+  t.room.apply(user, { t: 'play', position: 89.5 });
+  const oldSeq = t.room.state.seq;
+  t.room.apply(user, { t: 'seek', position: 89.5, resume: true });
+  const seq = t.room.state.seq;
+  t.room.apply(user, { t: 'ended', mediaId: 'abc', seq: oldSeq });
+  t.room.apply(user, { t: 'ended', mediaId: 'previous-episode', seq });
+  assert.equal(t.room.state.seq, seq);
+  assert.equal(t.room.state.playing, true);
+  t.room.apply(user, { t: 'ended', mediaId: 'abc', seq });
+  assert.equal(t.room.state.playing, false, 'the current final frame still ends playback');
   assert.equal(t.room.state.position, 90);
 });
 

@@ -1638,7 +1638,7 @@ function confirmDeleteRow(media) {
 }
 
 // ---------------------------------------------------------------------------
-// Uploads: one at a time, with an honest progress read-out
+// Uploads: three transfers at a time, with an honest progress read-out
 // ---------------------------------------------------------------------------
 
 const PENDING_KEY = 'anisync:uploads-in-flight';
@@ -1821,6 +1821,11 @@ function fillUploadRow(job, row, queued) {
     fill.style.width = '0%';
     detail.textContent = `${job.error || 'connection lost'} · attempt ${job.attempts + 1} of 3`;
     cancel.classList.remove('hidden');
+  } else if (job.phase === 'queued') {
+    phase.textContent = 'Queued';
+    fill.style.width = '0%';
+    detail.textContent = 'waiting for an upload slot';
+    cancel.classList.remove('hidden');
   } else if (job.phase === 'cancelled') {
     phase.textContent = 'Cancelled';
     fill.style.width = '0%';
@@ -1914,6 +1919,7 @@ function finishJob(job) {
   UPLOAD.active = UPLOAD.active.filter((entry) => entry !== job);
   UPLOAD.following = UPLOAD.following.filter((entry) => entry !== job);
   job.xhr = null;
+  if (job.phase === 'cancelled' || job.phase === 'failed') forgetPending(job.file.name);
   renderUpload();
   refreshLibrary();
   pumpUploads();
@@ -1946,7 +1952,7 @@ function runUpload(job) {
       toast(message, 'error');
       job.phase = 'failed';
       job.error = message;
-      renderUpload();
+      pumpUploads();
       return;
     }
     let added = null;
@@ -1979,6 +1985,7 @@ function runUpload(job) {
     forgetPending(job.file.name);
     renderUpload();
     toast(`${job.file.name} added as a track`);
+    pumpUploads();
     setTimeout(() => finishJob(job), 1600);
   };
   xhr.onerror = () => scheduleRetry(job, 'connection lost');
@@ -1993,7 +2000,7 @@ function runUpload(job) {
 function scheduleRetry(job, message) {
   if (job.cancelled) {
     job.phase = 'cancelled';
-    renderUpload();
+    pumpUploads();
     setTimeout(() => finishJob(job), 1200);
     return;
   }
@@ -2008,7 +2015,7 @@ function scheduleRetry(job, message) {
   }
   job.phase = 'failed';
   job.error = message;
-  renderUpload();
+  pumpUploads();
   toast(`${job.file.name} failed: ${message}`, 'error');
 }
 
@@ -2017,6 +2024,11 @@ function restartJob(job) {
   if (!UPLOAD.active.includes(job)) {
     UPLOAD.following = UPLOAD.following.filter((entry) => entry !== job);
     UPLOAD.active.push(job);
+  }
+  if (!['uploading', 'retrying'].includes(job.phase) && uploadSlotsUsed() >= UPLOAD.maxConcurrent) {
+    job.phase = 'queued';
+    renderUpload();
+    return;
   }
   job.loaded = 0;
   job.samples = [];
@@ -2027,8 +2039,15 @@ function restartJob(job) {
 }
 
 /** Start as many transfers as the concurrency limit allows. */
+function uploadSlotsUsed() {
+  return UPLOAD.active.filter((job) => job.phase === 'uploading' || job.phase === 'retrying').length;
+}
+
 function pumpUploads() {
-  while (UPLOAD.active.length < UPLOAD.maxConcurrent && UPLOAD.queue.length) {
+  while (uploadSlotsUsed() < UPLOAD.maxConcurrent) {
+    const retry = UPLOAD.active.find((job) => job.phase === 'queued');
+    if (retry) { restartJob(retry); continue; }
+    if (!UPLOAD.queue.length) break;
     const file = UPLOAD.queue.shift();
     const job = {
       id: ++UPLOAD.seq,
@@ -2058,7 +2077,7 @@ function uploadFiles(files) {
 
 // A reload drops the queue and kills transfers in flight; ask first.
 window.addEventListener('beforeunload', (event) => {
-  if (!UPLOAD.queue.length && !UPLOAD.active.length) return;
+  if (!UPLOAD.queue.length && !uploadSlotsUsed() && !UPLOAD.active.some((job) => job.phase === 'queued')) return;
   event.preventDefault();
   event.returnValue = '';
 });
@@ -2080,7 +2099,8 @@ el.uploadBar.addEventListener('click', (event) => {
       return;
     }
     job.cancelled = true;
-    job.xhr?.abort();
+    if (job.phase === 'retrying' || job.phase === 'queued') scheduleRetry(job, 'upload cancelled');
+    else job.xhr?.abort();
   }
 });
 
@@ -2296,7 +2316,9 @@ document.addEventListener('keydown', (event) => {
 
 // The credits roll for everyone: the room should pause, not keep counting.
 el.video.addEventListener('ended', () => {
-  if (state.room?.state?.playing) send({ t: 'ended' });
+  const room = state.room?.state;
+  if (!el.video.ended || streamPlayer.loading || room?.mediaId !== state.media?.id) return;
+  if (room?.playing) send({ t: 'ended', mediaId: room.mediaId, seq: room.seq });
   setPlayIcon(false);
   el.stage.classList.add('paused');
   setBadge('finished');

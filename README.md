@@ -114,6 +114,7 @@ All optional, via environment variables:
 npm test          # sync, room, media, HLS, rate-control and hardening checks
 npm run test:ui   # 131 checks driving the real UI in real Chrome
 npm run test:playback # isolated two-browser outage, quality-switch and audio regression
+npm run test:upload-ui # isolated browser upload, failure, retry and cancellation checks
 ```
 
 `npm run test:ui` needs the server running. Scenarios whose name matches an

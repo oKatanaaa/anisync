@@ -356,6 +356,11 @@ export class Room {
       // credits instead of letting the anchor run past the duration forever.
       case 'ended': {
         if (!this.state.playing || this.state.buffering) return { ok: true };
+        if ((msg.mediaId != null && msg.mediaId !== this.state.mediaId) ||
+            (msg.seq != null && msg.seq !== this.state.seq)) return { ok: true };
+        // A delayed event from the previous play or source must not end a replay.
+        // Allow a little clock/encode rounding at the final frame.
+        if (this.media?.duration > 0 && this.expected(now) < this.media.duration - 1) return { ok: true };
         const duration = this.media?.duration || this.state.position;
         this.#commit({ playing: false, buffering: false, bufferReason: null, position: duration, anchor: now, rate: 1 }, actor);
         return { ok: true };

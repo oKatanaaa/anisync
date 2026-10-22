@@ -222,6 +222,25 @@ try {
   await until(async () => { const s = await snapshot(b); return !s.managedBuffer && !s.sourceLoading && !s.buffering && s.currentTime > beforeFallback + 0.5; }, 'MP4 fallback');
   console.log('PASS segmented-playback fallback and a failed MP4 request recover at the current position');
 
+  await a.$eval('#seek', (element) => { element.value = '87'; element.dispatchEvent(new Event('change', { bubbles: true })); });
+  await until(async () => {
+    const [sa, sb] = await Promise.all([snapshot(a), snapshot(b)]);
+    return !sa.playing && !sb.playing && sa.currentTime > 89 && sb.currentTime > 89;
+  }, 'the final frame pauses both viewers');
+  await click(a, '#playBtn');
+  await until(async () => {
+    const [sa, sb] = await Promise.all([snapshot(a), snapshot(b)]);
+    return sa.playing && sb.playing && !sa.buffering && !sb.buffering && sa.currentTime > 0.5 && sb.currentTime > 0.5;
+  }, 'replay starts both viewers');
+  // An already queued event can arrive after a seek has cleared video.ended.
+  await b.$eval('#video', (video) => video.dispatchEvent(new Event('ended')));
+  await sleep(700);
+  const replay = await snapshot(b);
+  assert.equal(replay.playing, true, 'a delayed end event must not stop the replay');
+  assert.ok(replay.currentTime < 10, `replay stays near the start, got ${replay.currentTime}`);
+  assert.equal(await b.$eval('#syncBadge', (badge) => badge.textContent.includes('finished')), false);
+  console.log('PASS the final frame pauses everyone, replay restarts together, and stale end events are ignored');
+
   assert.deepEqual(errors, [], 'browser console stays clean');
   await fs.writeFile(path.join(output, 'playback-result.json'), JSON.stringify({ beforeOutage, held, heldA, heldB, held720, writes, segmentRequests, final: await snapshot(b), audioGap }, null, 2));
   console.log(`Playback regression passed. Evidence: ${output}`);
