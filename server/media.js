@@ -507,6 +507,8 @@ export class Library {
           : !item.bakedSubs && kinds.includes('styled') ? `/media/${item.id}/quality/${height}/video.mp4?v=${version}` : null,
         // The styled copy is what the menu checks before switching.
         ready: kinds.includes('styled'),
+        preparing: this.inflight.has(`${item.id}:h${height}`),
+        progress: item.preparingHeight === height ? item.progress : null,
       });
     }
     return ladder;
@@ -667,6 +669,7 @@ export class Library {
     const out = this.#heightPath(item.id, height, clean);
     const tmp = `${out}.partial.mp4`;
     item.preparingHeight = height;
+    item.error = null;
     this.preparingIds.add(item.id);
 
     try {
@@ -719,7 +722,7 @@ export class Library {
 
   #progress(item, pct, stage) {
     item.progress = Math.max(0, Math.min(100, Math.round(pct)));
-    this.onEvent({ type: 'progress', id: item.id, progress: item.progress, stage });
+    this.onEvent({ type: 'progress', id: item.id, progress: item.progress, stage, height: item.preparingHeight || null });
   }
 
   async #prepare(item) {

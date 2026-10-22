@@ -179,7 +179,7 @@ async function openEpisode(page, titlePart = DEMO) {
   await click(page, '.tab[data-tab=library]');
   const found = await waitFor(
     page,
-    (t) => [...document.querySelectorAll('#library .card')].some((c) => c.textContent.includes(t) && c.querySelector('.btn.primary')),
+    (t) => [...document.querySelectorAll('#library .card')].some((c) => c.textContent.includes(t) && c.querySelector('.card-open')),
     15000,
     'episode card',
     titlePart,
@@ -187,7 +187,7 @@ async function openEpisode(page, titlePart = DEMO) {
   if (!found) return false;
   await page.evaluate((t) => {
     const card = [...document.querySelectorAll('#library .card')].find((c) => c.textContent.includes(t));
-    card.querySelector('.btn.primary').click();
+    card.querySelector('.card-open').click();
   }, titlePart);
 
   const loaded = await waitFor(
@@ -340,13 +340,14 @@ await scenario('library renders the episode', async () => {
       title: c.querySelector('.title')?.textContent,
       meta: c.querySelector('.meta')?.textContent,
       posterLoaded: c.querySelector('.thumb')?.naturalWidth > 0,
-      button: c.querySelector('.btn')?.textContent,
+      clickable: Boolean(c.querySelector('.card-open[aria-label]')),
+      visiblePlay: [...c.querySelectorAll('.btn')].some((b) => b.textContent === 'Play'),
     };
   }, DEMO);
   check('card shows the episode title', card && card.title.includes(DEMO), card?.title, a);
   check('card shows duration and resolution', Boolean(card && /1:30/.test(card.meta) && /720p/.test(card.meta)), card?.meta, a);
   check('poster thumbnail loads', Boolean(card?.posterLoaded), '', a);
-  check('prepared episode offers Play', card?.button === 'Play', card?.button, a);
+  check('prepared episode is clickable without a visible Play button', card?.clickable && !card.visiblePlay, '', a);
 });
 
 await scenario('picking an episode', async () => {
@@ -358,11 +359,11 @@ await scenario('picking an episode', async () => {
 
   await click(a, '.tab[data-tab=library]');
   await sleep(500);
-  const label = await a.evaluate((t) => {
+  const selected = await a.evaluate((t) => {
     const card = [...document.querySelectorAll('#library .card')].find((c) => c.textContent.includes(t));
-    return card?.querySelector('.btn')?.textContent;
+    return card?.classList.contains('playing');
   }, DEMO);
-  check('library marks the loaded episode as Playing', label === 'Playing', label, a);
+  check('library highlights the loaded episode', selected, '', a);
 });
 
 await scenario('play pause seek resume', async () => {
@@ -673,13 +674,13 @@ await scenario('long file names', async () => {
     }, id);
     await waitFor(
       a,
-      () => [...document.querySelectorAll('#library .card')].find((n) => n.textContent.includes('Very Long'))?.querySelector('.btn.primary') != null,
+      () => [...document.querySelectorAll('#library .card')].find((n) => n.textContent.includes('Very Long'))?.querySelector('.card-open') != null,
       60000,
       'prepare',
     );
     await a.evaluate(() => {
       const c = [...document.querySelectorAll('#library .card')].find((n) => n.textContent.includes('Very Long'));
-      c.querySelector('.btn.primary').click();
+      c.querySelector('.card-open').click();
     });
     await waitFor(a, () => window.__sync.snapshot().readyState >= 1, 20000, 'ready');
     const meta = await a.evaluate(() => {
@@ -719,7 +720,7 @@ await scenario('episode disappears from the library', async () => {
     'fixture becomes playable',
     await waitFor(
       a,
-      () => [...document.querySelectorAll('#library .card')].find((n) => n.textContent.includes('Vanishing'))?.querySelector('.btn.primary') != null,
+      () => [...document.querySelectorAll('#library .card')].find((n) => n.textContent.includes('Vanishing'))?.querySelector('.card-open') != null,
       60000,
       'prepare',
     ),
@@ -727,7 +728,7 @@ await scenario('episode disappears from the library', async () => {
     a,
   );
   await a.evaluate(() => {
-    [...document.querySelectorAll('#library .card')].find((n) => n.textContent.includes('Vanishing')).querySelector('.btn.primary').click();
+    [...document.querySelectorAll('#library .card')].find((n) => n.textContent.includes('Vanishing')).querySelector('.card-open').click();
   });
   check('episode is loaded', await waitFor(a, () => window.__sync.snapshot().readyState >= 1, 20000, 'ready'), '', a);
 
@@ -959,7 +960,7 @@ await scenario('switchable audio and subtitle tracks', async () => {
     a,
     (title) => {
       const card = [...document.querySelectorAll('#library .card')].find((n) => n.textContent.includes(title));
-      return Boolean(card?.querySelector('.btn.primary'));
+      return Boolean(card?.querySelector('.card-open'));
     },
     90000,
     'prepare',
@@ -1136,7 +1137,7 @@ await scenario('no track controls when there is nothing to switch', async () => 
   }, plainId);
   await waitFor(
     a,
-    () => Boolean([...document.querySelectorAll('#library .card')].find((n) => n.textContent.includes('Plain Episode'))?.querySelector('.btn.primary')),
+    () => Boolean([...document.querySelectorAll('#library .card')].find((n) => n.textContent.includes('Plain Episode'))?.querySelector('.card-open')),
     60000,
     'prepare',
   );
@@ -1435,7 +1436,7 @@ await scenario('switching to a lighter rendition', async () => {
   }, id);
   await waitFor(
     a,
-    () => Boolean([...document.querySelectorAll('#library .card')].find((n) => n.textContent.includes('Ladder Episode'))?.querySelector('.btn.primary')),
+    () => Boolean([...document.querySelectorAll('#library .card')].find((n) => n.textContent.includes('Ladder Episode'))?.querySelector('.card-open')),
     60000,
     'prepare',
   );
@@ -1565,7 +1566,7 @@ await scenario('deleting an episode', async () => {
     60000,
     'delete button',
   );
-  check('the episode offers Play and a delete button', ready, '', a);
+  check('the episode offers a delete button', ready, '', a);
 
   const cardText = () =>
     a.evaluate(() => {

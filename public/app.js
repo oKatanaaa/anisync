@@ -370,6 +370,10 @@ function handle(msg) {
         if (bar) bar.style.width = `${msg.progress}%`;
         const label = card.querySelector('.meta');
         if (label) label.textContent = `${msg.stage || 'working'} · ${msg.progress}%`;
+        const encode = card.querySelector('.card-encode');
+        if (encode?.disabled && msg.stage === 'quality' && msg.height === 720 && encode.dataset.building === 'true') {
+          encode.textContent = `720p · ${msg.progress}%`;
+        }
       }
       // The subtitle-free copy is being built for the episode on screen: show
       // the progress inside the track menu, where the viewer is looking.
@@ -1492,6 +1496,19 @@ function renderLibrary() {
     card.className = 'card' + (state.media?.id === media.id ? ' playing' : '');
     card.dataset.media = media.id;
 
+    if (media.prepared && state.confirmDelete !== media.id) {
+      const open = document.createElement('button');
+      open.type = 'button';
+      open.className = 'card-open';
+      open.setAttribute('aria-label', `Play ${media.title}`);
+      open.title = `Play ${media.title}`;
+      open.onclick = () => {
+        send({ t: 'select', mediaId: media.id });
+        selectTab('chat');
+      };
+      card.appendChild(open);
+    }
+
     let thumb = null;
     if (media.poster) {
       thumb = document.createElement('img');
@@ -1530,16 +1547,7 @@ function renderLibrary() {
       err.textContent = 'failed';
       err.title = media.error;
       row.appendChild(err);
-    } else if (media.prepared) {
-      const play = document.createElement('button');
-      play.className = 'btn primary compact';
-      play.textContent = state.media?.id === media.id ? 'Playing' : 'Play';
-      play.onclick = () => {
-        send({ t: 'select', mediaId: media.id });
-        selectTab('chat');
-      };
-      row.appendChild(play);
-    } else {
+    } else if (!media.prepared) {
       const prep = document.createElement('button');
       prep.className = 'btn ghost compact';
       prep.textContent = media.preparing ? 'Preparing…' : 'Prepare';
@@ -1551,6 +1559,41 @@ function renderLibrary() {
         refreshLibrary();
       };
       row.appendChild(prep);
+    }
+
+    const quality = media.qualities?.find((q) => q.height === 720);
+    if (quality) {
+      const encode = document.createElement('button');
+      encode.type = 'button';
+      encode.className = 'btn ghost compact card-encode';
+      encode.dataset.building = String(Boolean(quality.preparing));
+      encode.textContent = quality.ready ? '720p ready'
+        : quality.preparing ? (quality.progress == null ? '720p queued…' : `720p · ${quality.progress}%`)
+          : 'Encode 720p';
+      encode.disabled = quality.ready || quality.preparing;
+      encode.title = quality.ready ? '720p is available in the player’s quality menu'
+        : 'Prepare a 720p copy without changing playback';
+      encode.onclick = async () => {
+        encode.disabled = true;
+        encode.textContent = '720p queued…';
+        try {
+          const response = await fetch(`/api/media/${media.id}/prepare`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ height: 720 }),
+          });
+          if (!response.ok) {
+            const body = await response.json().catch(() => ({}));
+            throw new Error(body.error || `Could not start 720p encoding (${response.status})`);
+          }
+        } catch (err) {
+          encode.disabled = false;
+          encode.textContent = 'Encode 720p';
+          toast(err.message || 'Could not start 720p encoding', 'error');
+        }
+        refreshLibrary();
+      };
+      row.appendChild(encode);
     }
 
     const del = document.createElement('button');

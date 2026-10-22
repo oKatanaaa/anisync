@@ -260,6 +260,10 @@ Earlier measurements on a 28-minute episode: **1080p 2.17 Mbps / 504 MB** versus
 **720p 1.17 Mbps / 291 MB** — about half the bandwidth for a phone on a relayed
 link. Extra rungs can be added with `ALT_HEIGHTS=720,480`.
 
+Click an episode's library card to open it. **Encode 720p** on the card prepares
+the lighter copy ahead of time without changing what anyone is watching. The
+button shows its queue/progress state and changes to **720p ready** when done.
+
 **External tracks.** Releases often ship the dub or subtitles as separate files.
 A file attaches to an episode when it shares the episode's full stem and has a
 usable extension:

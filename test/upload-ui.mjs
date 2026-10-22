@@ -107,8 +107,8 @@ try {
   execFileSync('ffmpeg', ['-y', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=160x120:rate=10',
     '-t', '3', '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', video], { stdio: 'pipe' });
   await (await page.$('#uploadInput')).uploadFile(video);
-  await page.waitForSelector('#library .card .btn.primary', { timeout: 15_000 });
-  await page.$eval('#library .card .btn.primary', (button) => button.click());
+  await page.waitForSelector('#library .card .card-open', { timeout: 15_000 });
+  await page.$eval('#library .card .card-open', (button) => button.click());
   await page.waitForFunction(() => document.getElementById('video').readyState >= 3, { timeout: 15_000 });
   await page.click('#playBtn');
   await page.waitForFunction(() => document.getElementById('video').currentTime > 0.5, { timeout: 15_000 });

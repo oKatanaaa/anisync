@@ -63,8 +63,6 @@ try {
   };
   await prepare({});
   await until(async () => (await library()).prepared, 'main rendition', 120_000);
-  await prepare({ height: 720 });
-  await until(async () => (await library()).qualities.find((q) => q.height === 720)?.ready, '720p rendition', 120_000);
 
   // Pace actual HLS bytes independently of WebSocket traffic. Zero pauses delivery.
   proxy = http.createServer(async (req, res) => {
@@ -130,8 +128,35 @@ try {
   const b = await viewer('Ben', true);
   const snapshot = (page) => page.evaluate(() => window.__sync.snapshot());
   const click = (page, selector) => page.$eval(selector, (element) => element.click());
-  await a.waitForSelector('#library .card .btn.primary');
-  await click(a, '#library .card .btn.primary');
+  await a.click('[data-tab="library"]');
+  await a.waitForSelector('.card-encode:not([disabled])');
+  // A failed request must leave a retry, without opening the episode.
+  let rejectEncode = true;
+  await a.setRequestInterception(true);
+  a.on('request', async (request) => {
+    try {
+      if (rejectEncode && request.url().endsWith(`/api/media/${id}/prepare`)) {
+        rejectEncode = false;
+        return await request.respond({ status: 503, contentType: 'application/json', body: '{"error":"Encoder unavailable"}' });
+      }
+      await request.continue();
+    } catch { /* Source switches can cancel requests. */ }
+  });
+  await a.click('.card-encode');
+  await a.waitForFunction(() => document.getElementById('toasts').textContent.includes('Encoder unavailable') && !document.querySelector('.card-encode').disabled);
+  await a.click('.card-encode');
+  assert.equal(await a.$eval('.card-encode', (button) => button.disabled), true);
+  assert.equal((await (await fetch(`${base}/api/library`)).json()).room.state.mediaId, null, 'encoding must not select the episode');
+  await until(async () => (await library()).qualities.find((q) => q.height === 720)?.ready, '720p rendition from the card', 120_000);
+  await a.waitForFunction(() => document.querySelector('.card-encode')?.textContent === '720p ready');
+  assert.equal(await a.$eval('.card-encode', (button) => button.disabled), true, 'a ready copy cannot be queued again');
+  await b.click('[data-tab="library"]');
+  await b.waitForFunction(() => document.querySelector('.card-encode')?.textContent === '720p ready');
+  assert.equal(await a.$$eval('#library .btn', (buttons) => buttons.some((b) => b.textContent === 'Play')), false);
+  // The real pointer hits the card overlay when clicking its title.
+  await a.click('#library .card .title');
+  assert.equal(await a.$eval('.tab.active', (tab) => tab.dataset.tab), 'chat');
+  console.log('PASS card encoding retries, builds 720p without selecting media, and updates both viewers; clicking the card opens playback');
   await until(async () => (await snapshot(a)).readyState >= 3 && (await snapshot(b)).readyState >= 3, 'decoded video');
   await click(a, '#playBtn');
   await until(async () => !(await snapshot(b)).buffering && (await snapshot(b)).currentTime > 0.5, 'coordinated start', 45_000);

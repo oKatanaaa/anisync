@@ -55,10 +55,13 @@ function broadcastUsers(users) {
 
 const library = new Library({
   onEvent: (evt) => {
-    if (evt.type === 'progress') broadcast({ t: 'progress', id: evt.id, progress: evt.progress, stage: evt.stage });
+    if (evt.type === 'progress') broadcast({ t: 'progress', id: evt.id, progress: evt.progress, stage: evt.stage, height: evt.height });
     if (evt.type === 'prepared') broadcast({ t: 'library' });
     if (evt.type === 'variant') broadcast({ t: 'library' });
-    if (evt.type === 'failed') broadcast({ t: 'notice', level: 'error', text: `Prepare failed: ${evt.message}` });
+    if (evt.type === 'failed') {
+      broadcast({ t: 'notice', level: 'error', text: `Prepare failed: ${evt.message}` });
+      broadcast({ t: 'library' });
+    }
   },
 });
 

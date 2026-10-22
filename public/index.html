@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="dark" />
 <title>AniSync — watch together</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%238b5cf6'/%3E%3Cstop offset='1' stop-color='%23ec4899'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='16' fill='url(%23g)'/%3E%3Cpath d='M26 20l18 12-18 12z' fill='white'/%3E%3C/svg%3E" />
-<link rel="stylesheet" href="/style.css?v=player-controls-1" />
+<link rel="stylesheet" href="/style.css?v=library-controls-2" />
 </head>
 <body>
 <div class="aurora" aria-hidden="true"><span></span><span></span><span></span></div>
@@ -98,7 +98,10 @@
             <svg class="i-play" viewBox="0 0 24 24" width="20" height="20"><path d="M8 5l12 7-12 7z" fill="currentColor"/></svg>
             <svg class="i-pause hidden" viewBox="0 0 24 24" width="20" height="20"><path d="M7 5h4v14H7zM13 5h4v14h-4z" fill="currentColor"/></svg>
           </button>
-          <div class="skip-controls" role="group" aria-label="Fast forward">
+          <div class="skip-controls" role="group" aria-label="Rewind and fast forward">
+            <button class="icon-btn text-btn" type="button" data-skip="-30" title="Rewind 30 seconds" aria-label="Rewind 30 seconds">−30s</button>
+            <button class="icon-btn text-btn" type="button" data-skip="-15" title="Rewind 15 seconds" aria-label="Rewind 15 seconds">−15s</button>
+            <button class="icon-btn text-btn" type="button" data-skip="-5" title="Rewind 5 seconds" aria-label="Rewind 5 seconds">−5s</button>
             <button class="icon-btn text-btn" type="button" data-skip="5" title="Fast forward 5 seconds" aria-label="Fast forward 5 seconds">+5s</button>
             <button class="icon-btn text-btn" type="button" data-skip="15" title="Fast forward 15 seconds" aria-label="Fast forward 15 seconds">+15s</button>
             <button class="icon-btn text-btn" type="button" data-skip="30" title="Fast forward 30 seconds" aria-label="Fast forward 30 seconds">+30s</button>
@@ -186,6 +189,6 @@
 
 <div id="toasts" class="toasts" aria-live="polite"></div>
 
-<script type="module" src="/app.js?v=upload-recovery-2"></script>
+<script type="module" src="/app.js?v=library-encode-1"></script>
 </body>
 </html>
