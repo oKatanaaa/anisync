@@ -19,8 +19,9 @@ sudo chown 1000:1000 media cache
 docker compose up -d --build
 ```
 
-Open **http://localhost:8080** and enter the password. Upload files in the Library
-panel, wait for preparation, then pick an episode. The room limit is three viewers.
+Open **http://localhost:8080** and enter the password. Drag one or more files into
+the Library panel or click **Upload**, wait for preparation, then pick an episode.
+The room limit is three viewers.
 
 The image includes Node.js 24, FFmpeg and fonts, runs as a non-root user, and uses
 CPU encoding. The deployment includes a health check, automatic restarts and bounded

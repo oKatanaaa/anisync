@@ -19,7 +19,7 @@ const base = `http://127.0.0.1:${port}`;
 const server = spawn(process.execPath, ['server/index.js'], {
   cwd: new URL('..', import.meta.url),
   env: { ...process.env, PORT: String(port), BIND: '127.0.0.1', MEDIA_DIR: path.join(root, 'media'),
-    CACHE_DIR: path.join(root, 'cache'), ENCODER: 'x264' }, stdio: ['ignore', 'pipe', 'pipe'],
+    CACHE_DIR: path.join(root, 'cache'), ENCODER: 'x264', PASSWORD: '' }, stdio: ['ignore', 'pipe', 'pipe'],
 });
 let logs = '';
 for (const stream of [server.stdout, server.stderr]) stream.on('data', (data) => { logs += data; });
@@ -46,9 +46,9 @@ try {
     try {
       if (request.url() !== `${base}/api/upload`) return await request.continue();
       requests += 1;
+      if (hold) { held.push(request); return; }
       if (realUploads) return await request.continue();
       if (networkFailure) return await request.abort('failed');
-      if (hold) { held.push(request); return; }
       await request.respond({ status: requests <= 4 ? 400 : 200, contentType: 'application/json',
         body: JSON.stringify(requests <= 4 ? { error: 'unsupported file type' } : { ok: true, id: null }) });
     } catch { /* Closing the browser cancels pending requests. */ }
@@ -57,6 +57,20 @@ try {
   await page.type('#nameInput', 'Upload tester');
   await page.click('#joinForm button');
   await page.waitForFunction(() => document.getElementById('join').classList.contains('hidden'));
+  const client = await page.createCDPSession();
+  async function dragFiles(files, selector = '#libraryDropzone') {
+    const point = await page.$eval(selector, element => {
+      const rect = element.getBoundingClientRect();
+      return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+    });
+    const data = { items: [], files, dragOperationsMask: 1 };
+    await client.send('Input.dispatchDragEvent', { type: 'dragEnter', ...point, data });
+    await client.send('Input.dispatchDragEvent', { type: 'dragOver', ...point, data });
+    assert.equal(await page.$eval('#panel-library', panel => getComputedStyle(panel).display !== 'none' && getComputedStyle(panel).boxShadow !== 'none'), true,
+      'file drags reveal and highlight the library');
+    await client.send('Input.dispatchDragEvent', { type: 'drop', ...point, data });
+    assert.equal(await page.$eval('#panel-library', panel => getComputedStyle(panel).boxShadow), 'none', 'drop clears the highlight');
+  }
   await page.click('[data-tab="library"]');
   const files = [];
   for (let i = 0; i < 6; i++) {
@@ -106,15 +120,45 @@ try {
   const video = path.join(root, 'Upload Demo.mp4');
   execFileSync('ffmpeg', ['-y', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=160x120:rate=10',
     '-t', '3', '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', video], { stdio: 'pipe' });
-  await (await page.$('#uploadInput')).uploadFile(video);
+  networkFailure = false;
+  await dragFiles([video]);
   await page.waitForSelector('#library .card .card-open', { timeout: 15_000 });
   await page.$eval('#library .card .card-open', (button) => button.click());
   await page.waitForFunction(() => document.getElementById('video').readyState >= 3, { timeout: 15_000 });
   await page.click('#playBtn');
   await page.waitForFunction(() => document.getElementById('video').currentTime > 0.5, { timeout: 15_000 });
   assert.deepEqual(await fs.readFile(path.join(root, 'media', 'Upload Demo.mp4')), await fs.readFile(video), 'uploaded video bytes stay intact');
+  console.log('PASS a dropped video uploads, prepares, appears in the library, and plays through the controls');
+
+  const subtitles = [];
+  const content = '1\n00:00:00,000 --> 00:00:01,000\nDrop test\n';
+  for (const language of ['en', 'ru', 'fr', 'ja', 'de']) {
+    const file = path.join(root, `Upload Demo.${language}.srt`);
+    await fs.writeFile(file, content);
+    subtitles.push(file);
+  }
+  // Start from Chat to verify that a file drag makes its upload queue visible.
+  await page.click('[data-tab="chat"]');
+  const beforeDrop = requests;
+  hold = true;
+  await dragFiles(subtitles, '#stage');
+  for (let i = 0; held.length < 3 && i < 100; i++) await sleep(20);
+  assert.equal(requests, beforeDrop + 3, 'multi-file drops use the three-transfer limit');
+  assert.equal(held.length, 3);
+  assert.equal(await page.$eval('.upload-queue', element => element.textContent), '2 more waiting');
+  hold = false;
+  for (const request of held.splice(0)) await request.continue();
+  for (const file of subtitles) {
+    const target = path.join(root, 'media', path.basename(file));
+    for (let i = 0; ; i++) {
+      try { assert.equal(await fs.readFile(target, 'utf8'), content); break; }
+      catch (error) { if (i >= 100) throw error; await sleep(50); }
+    }
+  }
+  assert.equal(requests, beforeDrop + 5, 'every dropped file uploads exactly once');
+  assert.equal(page.url(), `${base}/`, 'dropping files does not navigate away');
   assert.deepEqual(errors, []);
-  console.log('PASS a real video uploads, prepares, appears in the library, and plays through the controls');
+  console.log('PASS multi-file drops reveal the library and upload every file through the bounded queue');
 } finally {
   await browser?.close();
   if (server.exitCode === null && server.signalCode === null) {

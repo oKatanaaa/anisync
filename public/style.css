@@ -491,6 +491,18 @@ body {
 /* library */
 .library-actions { display: flex; gap: 8px; padding: 12px 14px 6px; }
 .upload-label { display: inline-flex; align-items: center; }
+.library-dropzone {
+  display: flex; flex-direction: column; gap: 4px;
+  margin: 6px 14px; padding: 16px 12px;
+  border: 1px dashed var(--line); border-radius: 12px;
+  text-align: center; cursor: pointer;
+}
+.library-dropzone strong { font-size: 12px; font-weight: 550; }
+.library-dropzone span { color: var(--muted); font-size: 11px; }
+.library-dropzone:hover, #panel-library.drag-over .library-dropzone {
+  border-color: var(--accent); background: rgba(139, 92, 246, 0.16);
+}
+#panel-library.drag-over { box-shadow: inset 0 0 0 2px var(--accent); }
 .library { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 14px 14px; display: flex; flex-direction: column; gap: 8px; }
 
 .card.no-thumb { grid-template-columns: minmax(0, 1fr); }

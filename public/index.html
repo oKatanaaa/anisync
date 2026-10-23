@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="dark" />
 <title>AniSync — watch together</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%238b5cf6'/%3E%3Cstop offset='1' stop-color='%23ec4899'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='16' fill='url(%23g)'/%3E%3Cpath d='M26 20l18 12-18 12z' fill='white'/%3E%3C/svg%3E" />
-<link rel="stylesheet" href="/style.css?v=library-controls-2" />
+<link rel="stylesheet" href="/style.css?v=library-drop-1" />
 </head>
 <body>
 <div class="aurora" aria-hidden="true"><span></span><span></span><span></span></div>
@@ -167,9 +167,13 @@
           <input id="uploadInput" type="file" multiple accept="video/*,.mkv,.ts,.m4a,.aac,.opus,.flac,.mp3,.ass,.ssa,.srt,.vtt" hidden />
         </label>
       </div>
+      <label for="uploadInput" class="library-dropzone" id="libraryDropzone">
+        <strong>Drop files here or click to upload</strong>
+        <span>One or more videos, audio or subtitle files</span>
+      </label>
       <div id="uploadBar" class="upload hidden"></div>
       <div id="library" class="library"></div>
-      <p class="hint" id="libraryHint">Upload a file here, or drop it into the server's <code>media/</code> folder and hit Rescan.</p>
+      <p class="hint" id="libraryHint">Drag files into the library, or add them to the server's <code>media/</code> folder and hit Rescan.</p>
     </div>
   </aside>
 </main>
@@ -190,6 +194,6 @@
 
 <div id="toasts" class="toasts" aria-live="polite"></div>
 
-<script type="module" src="/app.js?v=join-ready-1"></script>
+<script type="module" src="/app.js?v=library-drop-1"></script>
 </body>
 </html>

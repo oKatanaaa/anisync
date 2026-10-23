@@ -54,6 +54,7 @@ const el = {
   chatInput: $('chatInput'),
   people: $('people'),
   library: $('library'),
+  libraryPanel: $('panel-library'),
   libraryHint: $('libraryHint'),
   rescanBtn: $('rescanBtn'),
   uploadInput: $('uploadInput'),
@@ -1492,7 +1493,7 @@ function renderLibrary() {
   if (!state.mediaList.length) {
     const empty = document.createElement('p');
     empty.className = 'hint';
-    empty.textContent = 'No video files found yet. Upload one above, or drop files into the server’s media/ folder and rescan.';
+    empty.textContent = 'No video files found yet. Drop files here or click Upload to add videos.';
     el.library.appendChild(empty);
     return;
   }
@@ -2336,15 +2337,34 @@ el.uploadInput.addEventListener('change', (event) => {
   event.target.value = '';
 });
 
-['dragenter', 'dragover'].forEach((type) => {
-  document.addEventListener(type, (event) => {
-    if (event.dataTransfer?.types?.includes('Files')) event.preventDefault();
-  });
+let fileDragDepth = 0;
+function clearFileDrag() {
+  fileDragDepth = 0;
+  el.libraryPanel.classList.remove('drag-over');
+}
+
+document.addEventListener('dragenter', (event) => {
+  if (!event.dataTransfer?.types?.includes('Files')) return;
+  event.preventDefault();
+  fileDragDepth++;
+  selectTab('library');
+  el.libraryPanel.classList.add('drag-over');
 });
+document.addEventListener('dragover', (event) => {
+  if (!event.dataTransfer?.types?.includes('Files')) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = 'copy';
+});
+document.addEventListener('dragleave', () => {
+  if (fileDragDepth > 0 && --fileDragDepth === 0) clearFileDrag();
+});
+document.addEventListener('dragend', clearFileDrag);
 document.addEventListener('drop', (event) => {
+  clearFileDrag();
   const files = event.dataTransfer?.files;
   if (!files?.length) return;
   event.preventDefault();
+  selectTab('library');
   uploadFiles(files);
 });
 
