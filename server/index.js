@@ -213,7 +213,9 @@ app.delete('/api/media/:id', async (req, res, next) => {
     const item = library.get(id);
     if (!item) return res.status(404).json({ error: 'not in the library' });
     // Deleting mid-encode would pull the cache directory out from under ffmpeg.
-    if (item.preparing || [...hlsCache.inflight.keys()].some((key) => key.startsWith(`${id}:`))) return res.status(409).json({ error: 'still preparing — try again when it finishes' });
+    const preparing = [...library.inflight.keys(), ...hlsCache.inflight.keys()]
+      .some((key) => key === id || key.startsWith(`${id}:`));
+    if (item.preparing || preparing) return res.status(409).json({ error: 'still preparing — try again when it finishes' });
 
     const removed = await library.remove(id);
     if (!removed) return res.status(404).json({ error: 'not in the library' });
@@ -222,8 +224,8 @@ app.delete('/api/media/:id', async (req, res, next) => {
     if (room.state.mediaId === id) room.forgetMedia();
     pruneRoomMedia();
     broadcast({ t: 'library' });
-    log(`removed ${removed.title}${removed.trashed ? ' (moved to media/.trash)' : ''}`);
-    return res.json({ ok: true, trashed: Boolean(removed.trashed) });
+    log(`permanently deleted ${removed.title}`);
+    return res.json({ ok: true });
   } catch (err) {
     next(err);
   }

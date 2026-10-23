@@ -273,6 +273,7 @@ test('a 720p rendition is built beside the 1080p one, leaving it intact', async 
 
 test('deleting an episode takes its file, sidecars and cache with it', async () => {
   makeEpisode('Delete Me - 01.mkv');
+  const keep = makeEpisode('Keep Me - 01.mkv');
   await fs.writeFile(
     path.join(mediaDir, 'Delete Me - 01.en.srt'),
     '1\n00:00:00,200 --> 00:00:01,500\nBye.\n',
@@ -285,22 +286,25 @@ test('deleting an episode takes its file, sidecars and cache with it', async () 
   assert.equal(item.subs.filter((s) => s.origin === 'sidecar').length, 1, 'sidecar attached');
   await library.prepare(item.id);
   assert.ok(fss.existsSync(path.join(cacheDir, item.id, 'video.mp4')));
+  const { HlsCache } = await import('../server/hls.js');
+  await new HlsCache(cacheDir).ensure(item.id, 'video.mp4');
 
   const removed = await library.remove(item.id);
-  assert.equal(removed.trashed, true);
+  assert.equal(removed.title, item.title);
   assert.equal(fss.existsSync(path.join(mediaDir, 'Delete Me - 01.mkv')), false, 'source gone from the library');
   assert.equal(fss.existsSync(path.join(mediaDir, 'Delete Me - 01.en.srt')), false, 'sidecar gone too');
   assert.equal(fss.existsSync(path.join(cacheDir, item.id)), false, 'rendition and cache gone');
   assert.equal(library.get(item.id), null, 'no longer listed');
-  assert.ok(fss.existsSync(removed.dest), 'kept in media/.trash so a misclick is recoverable');
+  assert.equal(fss.existsSync(path.join(mediaDir, '.trash')), false, 'no recoverable copy consumes disk space');
+  assert.ok(fss.existsSync(keep), 'unrelated videos are preserved');
 
-  // A rescan must not resurrect it from the trash directory.
+  // A rescan must not resurrect the deleted episode.
   const after = new Library({});
   await after.scan();
   assert.equal(
     [...after.items.values()].some((i) => i.title.startsWith('Delete Me')),
     false,
-    'the trash folder is not part of the library',
+    'the deleted episode stays absent',
   );
 });
 

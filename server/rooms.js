@@ -15,7 +15,7 @@ const RATE_VALUES = new Set([0.75, 1, 1.25, 1.5]);
  * decides who hears it, which keeps the state machine testable.
  */
 export class Room {
-  constructor({ id = 'main', maxViewers = 3, startDelayMs = 1200, seekDelayMs = 700, idleResetMs = 60_000, now = () => Date.now(), onEvent = () => {} } = {}) {
+  constructor({ id = 'main', maxViewers = 8, startDelayMs = 1200, seekDelayMs = 700, idleResetMs = 60_000, now = () => Date.now(), onEvent = () => {} } = {}) {
     this.id = id;
     this.maxViewers = maxViewers;
     this.startDelayMs = startDelayMs;

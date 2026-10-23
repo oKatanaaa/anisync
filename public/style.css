@@ -836,7 +836,9 @@ video::cue {
   opacity: 0.2;
   cursor: default;
 }
+.row.confirm-delete { flex-wrap: wrap; }
 .confirm-text {
+  flex-basis: 100%;
   font-size: 11.5px;
   color: var(--muted);
 }

@@ -7,7 +7,7 @@ import {
   describeDrift,
 } from '/shared/sync.js?v=buffering-1';
 import { BUFFER, bufferedAhead, requiredBuffer } from '/shared/playback.js?v=buffering-1';
-import { StreamPlayer } from '/stream-player.js?v=buffering-1';
+import { StreamPlayer } from '/stream-player.js?v=lazy-hls-1';
 
 const $ = (id) => document.getElementById(id);
 
@@ -199,7 +199,7 @@ function connect(name) {
       return;
     }
     if (event.code === 4001) {
-      showJoin('The room is full — three seats only.');
+      showJoin('The room is full. Try again when someone leaves.');
       return;
     }
     try {
@@ -207,7 +207,7 @@ function connect(name) {
       if (session.status === 401) { location.assign('/login'); return; }
     } catch { /* Offline: retain the normal reconnect loop. */ }
     // Keep trying forever: a watch party lasts hours and Wi-Fi blips. The delay
-    // is capped, and jittered so three clients do not stampede a restarting
+    // is capped, and jittered so clients do not stampede a restarting
     // server in lockstep.
     state.retries += 1;
     const base = Math.min(15_000, 600 * 2 ** Math.min(state.retries, 5));
@@ -1378,7 +1378,7 @@ function renderAvatars() {
     node.title = `${user.name}${user.isHost ? ' (host)' : ''}${user.buffering ? ' · buffering' : ''}`;
     el.avatars.appendChild(node);
   }
-  const capacity = state.room?.capacity ?? 3;
+  const capacity = state.room?.capacity ?? 8;
   el.roomChip.textContent = `${state.users.length} / ${capacity} seats`;
 }
 
@@ -1630,7 +1630,10 @@ function renderLibrary() {
     // Deleting is a two-step action, and the question has to survive a library
     // refresh (a rescan, another episode finishing) instead of being wiped by
     // the next render.
-    if (state.confirmDelete === media.id) row.replaceChildren(...confirmDeleteRow(media));
+    if (state.confirmDelete === media.id) {
+      row.classList.add('confirm-delete');
+      row.replaceChildren(...confirmDeleteRow(media));
+    }
 
     body.append(title, meta, row);
     if (thumb) card.append(thumb, body);
@@ -1644,20 +1647,19 @@ function renderLibrary() {
 
 /**
  * Delete asks in place: the card's own buttons become a question, which is
- * smaller and less jarring than a modal. The file goes to media/.trash, so a
- * misclick on a 20 GB episode is recoverable.
+ * smaller and less jarring than a modal. Make permanent deletion explicit.
  */
 function confirmDeleteRow(media) {
   const onScreen = state.media?.id === media.id;
 
   const question = document.createElement('span');
   question.className = 'confirm-text';
-  question.textContent = onScreen ? 'Delete? Stops the room.' : 'Delete this file?';
+  question.textContent = onScreen ? 'Permanently delete? Stops the room.' : 'Permanently delete this video and its cache?';
 
   const yes = document.createElement('button');
   yes.className = 'btn compact danger';
   yes.type = 'button';
-  yes.textContent = 'Delete';
+  yes.textContent = 'Delete permanently';
   yes.onclick = async () => {
     yes.disabled = true;
     yes.textContent = 'Deleting…';
@@ -1668,7 +1670,7 @@ function confirmDeleteRow(media) {
         const body = await response.json().catch(() => ({}));
         throw new Error(body.error || `delete failed (${response.status})`);
       }
-      toast(`${media.title} removed`);
+      toast(`${media.title} permanently deleted`);
     } catch (err) {
       toast(err.message || 'delete failed', 'error');
     }
@@ -2170,9 +2172,9 @@ document.querySelectorAll('.tab').forEach((tab) => {
 function showJoin(message = '') {
   el.join.classList.remove('hidden');
   el.joinError.textContent = message;
-  el.nameInput.value = state.name;
-  // Enable entry only after the submit handler and app are ready.
-  el.nameInput.disabled = false;
+  // Keep a name typed while the app was downloading.
+  if (!el.nameInput.value) el.nameInput.value = state.name;
+  // Submission waits for its handler; typing is available immediately.
   el.joinButton.disabled = false;
   el.joinButton.textContent = 'Enter AniSync';
   setTimeout(() => el.nameInput.focus(), 80);
@@ -2489,9 +2491,4 @@ setInterval(() => {
   if (state.mediaList.some((m) => m.preparing)) refreshLibrary();
 }, 4000);
 
-if (state.name) {
-  el.nameInput.value = state.name;
-  showJoin();
-} else {
-  showJoin();
-}
+showJoin();

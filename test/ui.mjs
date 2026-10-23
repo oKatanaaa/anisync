@@ -272,7 +272,8 @@ await scenario('join flow and presence', async () => {
   const a = await join(await newPage(), 'Aiko');
 
   check('room starts when the first person joins', (await snap(a)).users === 1, '', a);
-  check('seats chip reads 1 / 3', (await text(a, '#roomChip')) === '1 / 3 seats', await text(a, '#roomChip'), a);
+  const capacity = (await snap(a)).capacity;
+  check('seats chip shows the configured capacity', (await text(a, '#roomChip')) === `1 / ${capacity} seats`, await text(a, '#roomChip'), a);
   check(
     'welcome notice appears exactly once',
     (await a.evaluate(
@@ -854,11 +855,11 @@ await scenario('sync quality with three viewers', async () => {
   check('every player reports a steady state', badges.every((s) => !/lagging|behind|starting/i.test(s)), badges.join(' | '), a);
 });
 
-await scenario('three seats', async () => {
+await scenario('room capacity', async () => {
   const a = await join(await newPage(), 'Bea');
-  await join(await newPage(), 'Cai');
-  await join(await newPage(), 'Dee');
-  check('three people fit', (await snap(a)).users === 3, '', a);
+  const capacity = (await snap(a)).capacity;
+  for (let i = 1; i < capacity; i++) await join(await newPage(), `Viewer ${i + 1}`);
+  check('the configured number of people fit', (await snap(a)).users === capacity, '', a);
 
   const extra = await newPage();
   await extra.goto(BASE, { waitUntil: 'domcontentloaded' });
@@ -867,14 +868,14 @@ await scenario('three seats', async () => {
     document.getElementById('nameInput').value = 'Eve';
     document.querySelector('#joinForm button[type=submit]').click();
   });
-  check('fourth person is refused', await waitFor(extra, () => /room is full/i.test(document.getElementById('joinError').textContent), 8000, 'refusal'), '', extra);
+  check('one extra person is refused', await waitFor(extra, () => /room is full/i.test(document.getElementById('joinError').textContent), 8000, 'refusal'), '', extra);
   check('refusal keeps them on the join screen', await waitFor(extra, () => {
     const n = document.getElementById('join');
     if (!n || n.classList.contains('hidden')) return false;
     const style = getComputedStyle(n);
     return style.display !== 'none' && Number(style.opacity) > 0.9 && n.getBoundingClientRect().height > 1;
   }, 5000, 'join modal'), '', extra);
-  check('the three viewers are unaffected', (await snap(a)).users === 3, '', a);
+  check('the existing viewers are unaffected', (await snap(a)).users === capacity, '', a);
 });
 
 await scenario('room empties and resets', async () => {
@@ -1602,7 +1603,7 @@ await scenario('deleting an episode', async () => {
     a,
   );
   check('the file is gone from the server', !fs.existsSync(file), file);
-  check('the deletion is confirmed to the user', (await tip(a)).some((t) => /removed/i.test(t)), (await tip(a)).join(' | '), a);
+  check('the deletion is confirmed to the user', (await tip(a)).some((t) => /permanently deleted/i.test(t)), (await tip(a)).join(' | '), a);
 });
 
 // ---------------------------------------------------------------------------

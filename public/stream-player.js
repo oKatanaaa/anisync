@@ -1,4 +1,3 @@
-import Hls from '/vendor/hls.mjs?v=1.7.3';
 import { BUFFER } from '/shared/playback.js?v=buffering-1';
 
 function rendition(url) {
@@ -61,10 +60,14 @@ export class StreamPlayer {
       this.video.load();
     };
     const source = rendition(url);
-    const mse = Hls.isSupported();
-    if (!source || (!mse && !this.video.canPlayType('application/vnd.apple.mpegurl'))) return native();
+    if (!source) return native();
     let timeout;
     try {
+      // The player library is large; nickname entry must not wait for it.
+      const { default: Hls } = await import('/vendor/hls.mjs?v=1.7.3');
+      if (!current()) return;
+      const mse = Hls.isSupported();
+      if (!mse && !this.video.canPlayType('application/vnd.apple.mpegurl')) return native();
       const requestAbort = new AbortController();
       abort.signal.addEventListener('abort', () => requestAbort.abort(), { once: true });
       timeout = setTimeout(() => requestAbort.abort(), 45_000);

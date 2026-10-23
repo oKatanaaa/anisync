@@ -21,7 +21,7 @@ test('password gates the app, media, actions and WebSocket connections', async (
   const password = 'a shared password with spaces & symbols!';
   const child = spawn(process.execPath, ['server/index.js'], {
     env: { ...process.env, PORT: String(port), BIND: '127.0.0.1', PASSWORD: password,
-      MEDIA_DIR: path.join(root, 'media'), CACHE_DIR: path.join(root, 'cache'), ENCODER: 'x264' },
+      MEDIA_DIR: path.join(root, 'media'), CACHE_DIR: path.join(root, 'cache'), ENCODER: 'x264', MAX_VIEWERS: '8' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let logs = '';
@@ -70,7 +70,7 @@ test('password gates the app, media, actions and WebSocket connections', async (
     assert.equal(response.status, 200, url);
     assert.match(response.headers.get('cache-control'), /private/);
   }
-  assert.equal((await fetch(`${base}/api/health`, { headers }).then(r => r.json())).capacity, 3);
+  assert.equal((await fetch(`${base}/api/health`, { headers }).then(r => r.json())).capacity, 8);
   const secure = await login(password, { 'X-Forwarded-Proto': 'https' });
   assert.match(secure.headers.get('set-cookie'), /; Secure/i);
   assert.equal((await fetch(`${base}/api/rescan`, { method: 'POST', headers: { ...headers, Origin: 'https://another.example' } })).status, 403);
@@ -97,14 +97,32 @@ test('password gates the app, media, actions and WebSocket connections', async (
   }
   await rejectedSocket({});
   await rejectedSocket({ ...headers, Origin: 'https://another.example' });
-  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?name=Viewer`, { headers });
-  const welcome = new Promise(resolve => ws.on('message', raw => {
-    const msg = JSON.parse(raw);
-    if (msg.t === 'welcome') resolve(msg);
+  const viewers = [];
+  t.after(() => viewers.forEach(ws => ws.terminate()));
+  for (let i = 1; i <= 8; i++) {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?name=Viewer${i}`, { headers });
+    viewers.push(ws);
+    const welcome = await new Promise((resolve, reject) => {
+      ws.on('message', raw => {
+        const message = JSON.parse(raw);
+        if (message.t === 'welcome') resolve(message);
+      });
+      ws.once('error', reject);
+    });
+    assert.equal(welcome.t, 'welcome');
+    assert.equal(welcome.you.name, `Viewer${i}`);
+    assert.equal(welcome.capacity, 8);
+    assert.equal(welcome.users.length, i);
+  }
+  const extra = new WebSocket(`ws://127.0.0.1:${port}/ws?name=Ninth`, { headers });
+  const rejected = JSON.parse((await once(extra, 'message'))[0]);
+  assert.equal(rejected.code, 'full', 'the ninth viewer is refused');
+  assert.equal((await once(extra, 'close'))[0], 4001);
+  await Promise.all(viewers.map(ws => {
+    const closed = once(ws, 'close');
+    ws.close();
+    return closed;
   }));
-  assert.equal((await welcome).you.name, 'Viewer');
-  ws.close();
-  await once(ws, 'close');
 
   for (let i = 0; i < 10; i++) assert.equal((await login('wrong')).status, 401);
   const limited = await login(password);

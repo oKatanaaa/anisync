@@ -142,11 +142,14 @@ try {
       await request.continue();
     } catch { /* Source switches can cancel requests. */ }
   });
-  await a.click('.card-encode');
+  await a.locator('.card-encode').click();
   await a.waitForFunction(() => document.getElementById('toasts').textContent.includes('Encoder unavailable') && !document.querySelector('.card-encode').disabled);
-  await a.click('.card-encode');
+  await a.locator('.card-encode').click();
   assert.equal(await a.$eval('.card-encode', (button) => button.disabled), true);
   assert.equal((await (await fetch(`${base}/api/library`)).json()).room.state.mediaId, null, 'encoding must not select the episode');
+  const deletingDuringEncode = await fetch(`${base}/api/media/${id}`, { method: 'DELETE' });
+  assert.equal(deletingDuringEncode.status, 409, 'an alternate-quality encode blocks permanent deletion');
+  assert.equal(await fs.stat(path.join(media, 'Buffer Episode - 01.mkv')).then(() => true, () => false), true, 'encoding source is preserved');
   await until(async () => (await library()).qualities.find((q) => q.height === 720)?.ready, '720p rendition from the card', 120_000);
   await a.waitForFunction(() => document.querySelector('.card-encode')?.textContent === '720p ready');
   assert.equal(await a.$eval('.card-encode', (button) => button.disabled), true, 'a ready copy cannot be queued again');

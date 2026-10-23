@@ -157,8 +157,26 @@ try {
   }
   assert.equal(requests, beforeDrop + 5, 'every dropped file uploads exactly once');
   assert.equal(page.url(), `${base}/`, 'dropping files does not navigate away');
+
+  // Permanent deletion must still require a confirmation, and Cancel keeps it intact.
+  await page.click('#library .card-delete');
+  assert.match(await page.$eval('.confirm-text', element => element.textContent), /Permanently delete/);
+  await page.$$eval('#library .card .btn', buttons => buttons.find(button => button.textContent === 'Cancel').click());
+  assert.deepEqual(await fs.readFile(path.join(root, 'media', 'Upload Demo.mp4')), await fs.readFile(video));
+  const listing = await (await fetch(`${base}/api/library`)).json();
+  const id = listing.media[0].id;
+  await page.click('#library .card-delete');
+  await page.click('#library .btn.danger');
+  await page.waitForFunction(() => !document.querySelector('#library .card'));
+  assert.equal(await fs.stat(path.join(root, 'media', 'Upload Demo.mp4')).then(() => true, () => false), false);
+  for (const file of subtitles) {
+    assert.equal(await fs.stat(path.join(root, 'media', path.basename(file))).then(() => true, () => false), false, 'attached tracks are deleted');
+  }
+  assert.equal(await fs.stat(path.join(root, 'cache', id)).then(() => true, () => false), false, 'all encoded copies and HLS cache are deleted');
+  assert.equal(await fs.stat(path.join(root, 'media', '.trash')).then(() => true, () => false), false, 'nothing is retained in trash');
   assert.deepEqual(errors, []);
   console.log('PASS multi-file drops reveal the library and upload every file through the bounded queue');
+  console.log('PASS cancelling preserves the video; confirming permanently deletes the video, tracks and cache');
 } finally {
   await browser?.close();
   if (server.exitCode === null && server.signalCode === null) {

@@ -21,7 +21,7 @@ docker compose up -d --build
 
 Open **http://localhost:8080** and enter the password. Drag one or more files into
 the Library panel or click **Upload**, wait for preparation, then pick an episode.
-The room limit is three viewers.
+The room limit is eight viewers.
 
 The image includes Node.js 24, FFmpeg and fonts, runs as a non-root user, and uses
 CPU encoding. The deployment includes a health check, automatic restarts and bounded
@@ -69,7 +69,7 @@ Copy `.env.example` to `.env`, change what you need, then run
 | `PASSWORD` | required | Shared login password; changing it invalidates existing sessions |
 | `MEDIA_DIR` | `./media` | Video folder on the host, mounted into the container |
 | `CACHE_DIR` | `./cache` | Prepared media and saved room state folder on the host |
-| `MAX_VIEWERS` | `3` | Room capacity |
+| `MAX_VIEWERS` | `8` | Room capacity |
 | `ENCODER` | `x264` | CPU encoding; hardware encoders need GPU access configured separately |
 | `SUBTITLES` | `bake` | `bake` preserves ASS styling; `track` uses soft WebVTT; `off` disables subtitles |
 | `MAX_HEIGHT` | `1080` | Maximum prepared video height |
@@ -85,7 +85,8 @@ Upload limits and playback timing are also configurable in `.env.example`.
 
 The player menus select audio, subtitles and quality independently for each
 viewer. Turning off burned-in subtitles prepares an extra subtitle-free copy.
-Deleted episodes move to the media folder's `.trash/`; empty it to reclaim space.
+Deleting an episode permanently removes its original file, attached tracks and
+all prepared copies and cache to reclaim disk space.
 
 External tracks must share the video's full filename stem:
 

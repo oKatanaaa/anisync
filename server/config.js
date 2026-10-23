@@ -13,8 +13,7 @@ export const config = {
   mediaDir: path.resolve(process.env.MEDIA_DIR || path.join(root, 'media')),
   cacheDir: path.resolve(process.env.CACHE_DIR || path.join(root, 'cache')),
 
-  /** The brief: three people, no more. */
-  maxViewers: num(process.env.MAX_VIEWERS, 3),
+  maxViewers: num(process.env.MAX_VIEWERS, 8),
 
   /** Scheduled-start lead time, giving slow buffers a chance to catch up. */
   startDelayMs: num(process.env.START_DELAY_MS, 1200),

@@ -1,4 +1,4 @@
-/** Password-to-room flow, including a cold load with delayed player scripts. */
+/** Password-to-room flow, including name entry before the app finishes loading. */
 import puppeteer from 'puppeteer';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -20,7 +20,7 @@ const password = 'browser test password';
 const server = spawn(process.execPath, ['server/index.js'], {
   cwd: new URL('..', import.meta.url),
   env: { ...process.env, PORT: String(port), BIND: '127.0.0.1', PASSWORD: password,
-    MEDIA_DIR: path.join(root, 'media'), CACHE_DIR: path.join(root, 'cache'), ENCODER: 'x264', MAX_VIEWERS: '3' },
+    MEDIA_DIR: path.join(root, 'media'), CACHE_DIR: path.join(root, 'cache'), ENCODER: 'x264', MAX_VIEWERS: '8' },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 let logs = '';
@@ -41,11 +41,13 @@ try {
   await page.setCacheEnabled(false);
   await page.setRequestInterception(true);
   let documents = 0;
-  let delayPlayer = true;
+  let delayApp = true;
+  let playerRequests = 0;
   const held = [];
   page.on('request', request => {
     if (request.isNavigationRequest() && request.frame() === page.mainFrame() && new URL(request.url()).pathname === '/') documents++;
-    if (delayPlayer && new URL(request.url()).pathname === '/vendor/hls.mjs') held.push(request);
+    if (new URL(request.url()).pathname === '/vendor/hls.mjs') playerRequests++;
+    if (delayApp && new URL(request.url()).pathname === '/app.js') held.push(request);
     else request.continue().catch(() => {});
   });
   await page.goto(`${base}/login`);
@@ -53,33 +55,37 @@ try {
   await page.keyboard.press('Enter');
   await page.waitForSelector('#nameInput', { visible: true });
   for (let i = 0; !held.length; i++) {
-    assert.ok(i < 100, 'player dependency was intercepted');
+    assert.ok(i < 100, 'app download was intercepted');
     await sleep(20);
   }
   assert.equal(await page.evaluate(() => Boolean(window.__sync)), false, 'the app is still loading');
+  assert.equal(await page.$eval('#nameInput', input => input.disabled), false, 'name entry is available immediately');
   // This used to submit a native GET and reload the nickname screen.
   await page.focus('#nameInput');
-  await page.keyboard.type('Early viewer');
+  await page.keyboard.type('First viewer');
   await page.keyboard.press('Enter');
   await sleep(300);
   assert.equal(documents, 1, 'Enter during startup must not reload the page');
   await page.click('#joinForm button');
   await sleep(300);
   assert.equal(documents, 1, 'clicking during startup must not reload the page');
-  assert.equal(await page.$eval('#nameInput', input => input.disabled), true, 'name entry waits for the app');
   assert.equal(await page.$eval('#joinForm button', button => button.disabled), true);
   assert.match(await page.$eval('#joinForm button', button => button.textContent), /Loading/);
 
-  delayPlayer = false;
+  delayApp = false;
   await Promise.all(held.splice(0).map(request => request.continue()));
   await page.waitForFunction(() => window.__sync && !document.getElementById('nameInput').disabled);
-  await page.type('#nameInput', 'First viewer');
+  assert.equal(await page.$eval('#nameInput', input => input.value), 'First viewer', 'app startup preserves the name already typed');
+  assert.equal(playerRequests, 0, 'the player library does not delay nickname entry');
+  await page.focus('#nameInput');
   await page.keyboard.press('Enter');
   await page.waitForFunction(() => document.getElementById('join').classList.contains('hidden') && window.__sync.snapshot().users === 1);
   assert.equal(documents, 1, 'one nickname submission joins without navigation');
   assert.equal(await page.evaluate(() => localStorage.getItem('anisync:name')), 'First viewer');
   assert.match(await page.$eval('#people', people => people.textContent), /First viewer/);
-  console.log('PASS password login and delayed scripts require only one nickname submission');
+  assert.equal(await page.$eval('#roomChip', chip => chip.textContent), '1 / 8 seats');
+  assert.equal(playerRequests, 0, 'an empty room does not download the player library');
+  console.log('PASS immediate name entry survives delayed startup and joins without waiting for the player library');
 
   await page.reload({ waitUntil: 'domcontentloaded' });
   assert.equal(await page.$eval('#nameInput', input => input.value), 'First viewer', 'reload prefills the remembered name');

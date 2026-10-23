@@ -9,7 +9,7 @@ services:
     environment:
       PASSWORD: ${PASSWORD:?Set PASSWORD in .env before starting AniSync}
       ENCODER: ${ENCODER:-x264}
-      MAX_VIEWERS: ${MAX_VIEWERS:-3}
+      MAX_VIEWERS: ${MAX_VIEWERS:-8}
       SUBTITLES: ${SUBTITLES:-bake}
       MAX_HEIGHT: ${MAX_HEIGHT:-1080}
       ALT_HEIGHTS: ${ALT_HEIGHTS:-720}
