@@ -10,6 +10,7 @@
     "test": "node --test test/*.test.js",
     "start": "node --env-file-if-exists=.env server/index.js",
     "test:ui": "node test/ui.mjs",
+    "test:auth-ui": "node test/auth-ui.mjs",
     "test:playback": "node test/playback-ui.mjs",
     "test:upload-ui": "node test/upload-ui.mjs",
     "test:unit": "node --test test/*.test.js"

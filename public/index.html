@@ -181,14 +181,15 @@
     </div>
     <h2>Join the room</h2>
     <p>Pick a name your friends will recognise. Three seats, no accounts.</p>
-    <input id="nameInput" type="text" maxlength="24" placeholder="Your name" required />
-    <button class="btn primary wide" type="submit">Enter AniSync</button>
+    <!-- Module dependencies may still be downloading on a first visit. -->
+    <input id="nameInput" type="text" maxlength="24" placeholder="Your name" required disabled />
+    <button id="joinButton" class="btn primary wide" type="submit" disabled>Loading…</button>
     <p class="modal-foot" id="joinError"></p>
   </form>
 </div>
 
 <div id="toasts" class="toasts" aria-live="polite"></div>
 
-<script type="module" src="/app.js?v=password-1"></script>
+<script type="module" src="/app.js?v=join-ready-1"></script>
 </body>
 </html>

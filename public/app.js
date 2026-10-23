@@ -60,6 +60,7 @@ const el = {
   uploadBar: $('uploadBar'),
   join: $('join'),
   joinForm: $('joinForm'),
+  joinButton: $('joinButton'),
   joinError: $('joinError'),
   nameInput: $('nameInput'),
   toasts: $('toasts'),
@@ -2169,6 +2170,10 @@ function showJoin(message = '') {
   el.join.classList.remove('hidden');
   el.joinError.textContent = message;
   el.nameInput.value = state.name;
+  // Enable entry only after the submit handler and app are ready.
+  el.nameInput.disabled = false;
+  el.joinButton.disabled = false;
+  el.joinButton.textContent = 'Enter AniSync';
   setTimeout(() => el.nameInput.focus(), 80);
 }
 
